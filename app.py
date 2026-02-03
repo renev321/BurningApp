@@ -1,23 +1,16 @@
-import json
-import random
 import sqlite3
 from datetime import datetime
-from typing import Optional, Dict, Any, List
-
+import random
+import string
 import pandas as pd
 import streamlit as st
-from streamlit_agraph import agraph, Node, Edge, Config
 
-# =========================================================
-# Config
-# =========================================================
-st.set_page_config(page_title="Bracket Nodes + Cost Simulator", layout="wide")
-DB_PATH = "bracket_nodes.db"
+st.set_page_config(page_title="Account Fight Simulator", layout="wide")
 
-# =========================================================
-# DB
-# =========================================================
-def db() -> sqlite3.Connection:
+DB_PATH = "account_game.db"
+
+# -------------------- DB --------------------
+def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
@@ -27,75 +20,83 @@ def init_db():
     cur = conn.cursor()
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS rules(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      account_cost_usd REAL NOT NULL DEFAULT 216,
+      reset_cost_usd REAL NOT NULL DEFAULT 100,
+      max_resets INTEGER NOT NULL DEFAULT 5,
+      auto_delete_on_exhaust INTEGER NOT NULL DEFAULT 1
+    );
+    """)
+    cur.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS participants(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        created_at TEXT NOT NULL
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
     );
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS accounts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        participant_id INTEGER NOT NULL,
-        nickname TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (participant_id) REFERENCES participants(id)
-    );
-    """)
-
-    # Global rules stored once
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rules(
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        account_fee_usd REAL NOT NULL DEFAULT 216,
-        reset_cost_usd REAL NOT NULL DEFAULT 100,
-        max_resets INTEGER NOT NULL DEFAULT 5
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      participant_id INTEGER NOT NULL,
+      code TEXT NOT NULL,                 -- auto name like A0001 / P1-0003
+      active INTEGER NOT NULL DEFAULT 1,  -- 1 active, 0 inactive
+      resets_used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(participant_id) REFERENCES participants(id)
     );
     """)
 
     cur.execute("""
-    INSERT OR IGNORE INTO rules(id, account_fee_usd, reset_cost_usd, max_resets)
-    VALUES(1, 216, 100, 5);
-    """)
-
-    # Tournament + State
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tournaments(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tournament_state(
-        tournament_id INTEGER PRIMARY KEY,
-        state_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+    CREATE TABLE IF NOT EXISTS matches(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_name TEXT NOT NULL,
+      a_account_id INTEGER NOT NULL,
+      b_account_id INTEGER NOT NULL,
+      winner_account_id INTEGER NULL,
+      loser_account_id INTEGER NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT NULL
     );
     """)
 
     conn.commit()
     conn.close()
 
-def get_rules() -> Dict[str, Any]:
+def get_rules():
     conn = db()
-    row = conn.execute("SELECT account_fee_usd, reset_cost_usd, max_resets FROM rules WHERE id=1").fetchone()
+    row = conn.execute("""
+      SELECT account_cost_usd, reset_cost_usd, max_resets, auto_delete_on_exhaust
+      FROM rules WHERE id=1
+    """).fetchone()
     conn.close()
-    return {"account_fee_usd": row[0], "reset_cost_usd": row[1], "max_resets": row[2]}
+    return {
+        "account_cost_usd": float(row[0]),
+        "reset_cost_usd": float(row[1]),
+        "max_resets": int(row[2]),
+        "auto_delete_on_exhaust": bool(row[3]),
+    }
 
-def set_rules(account_fee_usd: float, reset_cost_usd: float, max_resets: int):
+def set_rules(account_cost_usd, reset_cost_usd, max_resets, auto_delete_on_exhaust):
     conn = db()
-    conn.execute(
-        "UPDATE rules SET account_fee_usd=?, reset_cost_usd=?, max_resets=? WHERE id=1",
-        (float(account_fee_usd), float(reset_cost_usd), int(max_resets))
-    )
+    conn.execute("""
+      UPDATE rules
+      SET account_cost_usd=?, reset_cost_usd=?, max_resets=?, auto_delete_on_exhaust=?
+      WHERE id=1
+    """, (float(account_cost_usd), float(reset_cost_usd), int(max_resets), 1 if auto_delete_on_exhaust else 0))
     conn.commit()
     conn.close()
 
-def upsert_participant(name: str):
+def list_participants():
+    conn = db()
+    df = pd.read_sql_query("SELECT id, name FROM participants ORDER BY name", conn)
+    conn.close()
+    return df
+
+def add_participant(name: str):
     conn = db()
     conn.execute(
         "INSERT OR IGNORE INTO participants(name, created_at) VALUES(?, ?)",
@@ -104,478 +105,360 @@ def upsert_participant(name: str):
     conn.commit()
     conn.close()
 
-def list_participants() -> pd.DataFrame:
+def delete_participant(pid: int):
     conn = db()
-    df = pd.read_sql_query("SELECT id, name FROM participants ORDER BY name", conn)
-    conn.close()
-    return df
-
-def add_account(participant_name: str, nickname: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM participants WHERE name=?", (participant_name.strip(),))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise ValueError("Participant not found.")
-    pid = row[0]
-    conn.execute(
-        "INSERT INTO accounts(participant_id, nickname, created_at) VALUES(?, ?, ?)",
-        (pid, nickname.strip(), datetime.utcnow().isoformat())
-    )
+    conn.execute("DELETE FROM accounts WHERE participant_id=?", (int(pid),))
+    conn.execute("DELETE FROM participants WHERE id=?", (int(pid),))
     conn.commit()
     conn.close()
 
-def list_accounts() -> pd.DataFrame:
+def next_account_code(pid: int, pname: str) -> str:
+    # e.g., REN-0001 or P2-0003
+    prefix = "".join([c for c in pname.upper() if c.isalnum()])[:3]
+    prefix = prefix if prefix else f"P{pid}"
+    conn = db()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM accounts WHERE participant_id=?",
+        (int(pid),)
+    ).fetchone()[0]
+    conn.close()
+    return f"{prefix}-{n+1:04d}"
+
+def buy_account(pid: int, pname: str):
+    code = next_account_code(pid, pname)
+    conn = db()
+    conn.execute("""
+      INSERT INTO accounts(participant_id, code, active, resets_used, created_at)
+      VALUES(?, ?, 1, 0, ?)
+    """, (int(pid), code, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def list_accounts_full():
     conn = db()
     df = pd.read_sql_query("""
-    SELECT a.id, p.name AS participant, a.nickname
-    FROM accounts a
-    JOIN participants p ON p.id = a.participant_id
-    ORDER BY p.name, a.nickname
+      SELECT a.id,
+             p.name AS participant,
+             a.code,
+             a.active,
+             a.resets_used,
+             a.created_at
+      FROM accounts a
+      JOIN participants p ON p.id=a.participant_id
+      ORDER BY p.name, a.created_at DESC
     """, conn)
     conn.close()
     return df
 
-def create_tournament(name: str) -> int:
+def toggle_account_active(account_id: int, active: bool):
     conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO tournaments(name, created_at) VALUES(?, ?)",
-        (name.strip(), datetime.utcnow().isoformat())
-    )
-    tid = cur.lastrowid
+    conn.execute("UPDATE accounts SET active=? WHERE id=?", (1 if active else 0, int(account_id)))
     conn.commit()
     conn.close()
-    return tid
 
-def list_tournaments() -> pd.DataFrame:
+def delete_account(account_id: int):
     conn = db()
-    df = pd.read_sql_query("SELECT id, name, created_at FROM tournaments ORDER BY id DESC", conn)
+    conn.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
+    conn.commit()
+    conn.close()
+
+def apply_loss_to_loser(account_id: int, rules):
+    # increments resets_used; deactivates or deletes if exhausted
+    conn = db()
+    cur = conn.cursor()
+    row = cur.execute("SELECT resets_used, active FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+    if not row:
+        conn.close()
+        return
+
+    resets_used = int(row[0])
+    if resets_used >= rules["max_resets"]:
+        # already exhausted; enforce cleanup if desired
+        if rules["auto_delete_on_exhaust"]:
+            cur.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
+        else:
+            cur.execute("UPDATE accounts SET active=0 WHERE id=?", (int(account_id),))
+        conn.commit()
+        conn.close()
+        return
+
+    resets_used += 1
+    if resets_used >= rules["max_resets"]:
+        # exhausted now
+        if rules["auto_delete_on_exhaust"]:
+            cur.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
+        else:
+            cur.execute("UPDATE accounts SET resets_used=?, active=0 WHERE id=?", (resets_used, int(account_id)))
+    else:
+        cur.execute("UPDATE accounts SET resets_used=? WHERE id=?", (resets_used, int(account_id)))
+
+    conn.commit()
+    conn.close()
+
+# -------------------- Matchmaking --------------------
+def gen_session_name():
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    rnd = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    return f"SESSION-{stamp}-{rnd}"
+
+def pick_next_match(rules) -> tuple[pd.Series, pd.Series] | tuple[None, None]:
+    # Choose 2 active accounts from different participants, with resets remaining
+    df = list_accounts_full()
+    if df.empty:
+        return None, None
+
+    df["resets_remaining"] = rules["max_resets"] - df["resets_used"]
+    df = df[(df["active"] == 1) & (df["resets_remaining"] > 0)]
+    if len(df) < 2:
+        return None, None
+
+    # ensure different participants
+    participants = df["participant"].unique().tolist()
+    if len(participants) < 2:
+        return None, None
+
+    # pick first participant randomly, then pick another different
+    p1 = random.choice(participants)
+    p2_choices = [p for p in participants if p != p1]
+    p2 = random.choice(p2_choices)
+
+    a = df[df["participant"] == p1].sample(1).iloc[0]
+    b = df[df["participant"] == p2].sample(1).iloc[0]
+    return a, b
+
+def create_match(session_name: str, a_id: int, b_id: int):
+    conn = db()
+    conn.execute("""
+      INSERT INTO matches(session_name, a_account_id, b_account_id, created_at)
+      VALUES(?, ?, ?, ?)
+    """, (session_name, int(a_id), int(b_id), datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def resolve_match(match_id: int, winner_id: int, loser_id: int):
+    conn = db()
+    conn.execute("""
+      UPDATE matches
+      SET winner_account_id=?, loser_account_id=?, resolved_at=?
+      WHERE id=?
+    """, (int(winner_id), int(loser_id), datetime.utcnow().isoformat(), int(match_id)))
+    conn.commit()
+    conn.close()
+
+def get_latest_open_match() -> pd.Series | None:
+    conn = db()
+    df = pd.read_sql_query("""
+      SELECT id, session_name, a_account_id, b_account_id, created_at
+      FROM matches
+      WHERE resolved_at IS NULL
+      ORDER BY id DESC
+      LIMIT 1
+    """, conn)
+    conn.close()
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+def accounts_by_id(ids: list[int]) -> pd.DataFrame:
+    if not ids:
+        return pd.DataFrame()
+    conn = db()
+    q = f"""
+      SELECT a.id, p.name AS participant, a.code, a.active, a.resets_used
+      FROM accounts a
+      JOIN participants p ON p.id=a.participant_id
+      WHERE a.id IN ({",".join(["?"]*len(ids))})
+    """
+    df = pd.read_sql_query(q, conn, params=[int(x) for x in ids])
     conn.close()
     return df
 
-def save_state(tournament_id: int, state: dict):
-    conn = db()
-    conn.execute("""
-    INSERT INTO tournament_state(tournament_id, state_json, updated_at)
-    VALUES(?, ?, ?)
-    ON CONFLICT(tournament_id) DO UPDATE SET
-        state_json=excluded.state_json,
-        updated_at=excluded.updated_at
-    """, (int(tournament_id), json.dumps(state), datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-def load_state(tournament_id: int) -> Optional[dict]:
-    conn = db()
-    row = conn.execute("SELECT state_json FROM tournament_state WHERE tournament_id=?", (int(tournament_id),)).fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else None
-
-# =========================================================
-# Bracket State (single elimination) + Cost tracking
-# =========================================================
-def next_pow2(n: int) -> int:
-    p = 1
-    while p < n:
-        p *= 2
-    return p
-
-def seed_bracket(accounts: List[dict], shuffle=True) -> dict:
-    players = accounts[:]
-    if shuffle:
-        random.shuffle(players)
-
-    n = len(players)
-    size = next_pow2(n)
-    slots = players + [None] * (size - n)
-
-    matches = []
-    match_id = 1
-    for i in range(0, size, 2):
-        a = slots[i]
-        b = slots[i+1]
-        matches.append({
-            "match_id": match_id,
-            "a": a,
-            "b": b,
-            "winner_id": None,
-            "loser_id": None,
-            "note": "",
-        })
-        match_id += 1
-
-    state = {
-        "created_at": datetime.utcnow().isoformat(),
-        "round": 1,
-        "matches": matches,
-        "history": [],  # completed rounds
-        # per-account simulation ledger
-        "ledger": {
-            # account_id: { "resets_used": 0, "status": "Active", "loss_usd": fee+resets }
-        },
-        "completed": False
-    }
-    return state
-
-def init_ledger_if_missing(state: dict, accounts: List[dict], rules: dict):
-    ledger = state.get("ledger", {})
-    for a in accounts:
-        aid = str(a["id"])
-        if aid not in ledger:
-            ledger[aid] = {
-                "resets_used": 0,
-                "status": "Active",  # Active / Exhausted
-                "loss_usd": float(rules["account_fee_usd"]),  # fee counts once
-                "participant": a["participant"],
-                "nickname": a["nickname"]
-            }
-    state["ledger"] = ledger
-
-def account_alive(state: dict, account_id: int) -> bool:
-    rec = state["ledger"].get(str(account_id))
-    return rec is not None and rec["status"] == "Active"
-
-def apply_loss_to_loser(state: dict, loser_id: int, rules: dict):
-    rec = state["ledger"][str(loser_id)]
-    if rec["status"] != "Active":
-        return
-
-    if rec["resets_used"] < int(rules["max_resets"]):
-        rec["resets_used"] += 1
-        rec["loss_usd"] += float(rules["reset_cost_usd"])
-        # still active unless we just hit limit and you want to mark exhausted at max
-        if rec["resets_used"] >= int(rules["max_resets"]):
-            rec["status"] = "Exhausted"
-    else:
-        rec["status"] = "Exhausted"
-
-def build_next_round(state: dict):
-    # only if all matches have a winner (or BYE)
-    for m in state["matches"]:
-        a = m["a"]; b = m["b"]
-        if a is None and b is None:
-            m["winner_id"] = None
-        elif a is not None and b is None:
-            m["winner_id"] = a["id"]
-        elif a is None and b is not None:
-            m["winner_id"] = b["id"]
-        else:
-            if m["winner_id"] is None:
-                return state  # not ready
-
-    winners = []
-    for m in state["matches"]:
-        if m["winner_id"] is not None:
-            # find winner obj
-            if m["a"] is not None and m["a"]["id"] == m["winner_id"]:
-                winners.append(m["a"])
-            elif m["b"] is not None and m["b"]["id"] == m["winner_id"]:
-                winners.append(m["b"])
-
-    # archive current round
-    state["history"].append({"round": state["round"], "matches": state["matches"]})
-
-    if len(winners) <= 1:
-        state["completed"] = True
-        state["matches"] = []
-        return state
-
-    # build next round
-    next_matches = []
-    match_id = 1
-    for i in range(0, len(winners), 2):
-        a = winners[i]
-        b = winners[i+1] if i+1 < len(winners) else None
-        next_matches.append({
-            "match_id": match_id,
-            "a": a,
-            "b": b,
-            "winner_id": None if (a and b) else (a["id"] if a else None),
-            "loser_id": None,
-            "note": "",
-        })
-        match_id += 1
-
-    state["round"] += 1
-    state["matches"] = next_matches
-    return state
-
-# =========================================================
-# Graph rendering (Nodes)
-# =========================================================
-def make_graph_for_round(state: dict) -> tuple[list[Node], list[Edge]]:
-    nodes: list[Node] = []
-    edges: list[Edge] = []
-
-    # round title node
-    nodes.append(Node(id=f"R{state['round']}", label=f"Round {state['round']}", size=18))
-
-    for m in state["matches"]:
-        mid = m["match_id"]
-        match_node_id = f"M{state['round']}_{mid}"
-        nodes.append(Node(
-            id=match_node_id,
-            label=f"Match {mid}",
-            size=22
-        ))
-        edges.append(Edge(source=f"R{state['round']}", target=match_node_id))
-
-        def add_acc_node(acc, side_label: str):
-            aid = acc["id"]
-            led = state["ledger"].get(str(aid), {})
-            status = led.get("status", "Active")
-            resets = led.get("resets_used", 0)
-
-            label = f"{acc['participant']}\n{acc['nickname']} (#{aid})\n{status} | resets {resets}"
-            nid = f"A{aid}"
-            # Node already exists? keep unique
-            if not any(n.id == nid for n in nodes):
-                nodes.append(Node(id=nid, label=label, size=18))
-            edges.append(Edge(source=nid, target=match_node_id, label=side_label))
-
-        if m["a"] is not None:
-            add_acc_node(m["a"], "A")
-        else:
-            bye_id = f"BYE_A_{state['round']}_{mid}"
-            nodes.append(Node(id=bye_id, label="BYE", size=14))
-            edges.append(Edge(source=bye_id, target=match_node_id, label="A"))
-
-        if m["b"] is not None:
-            add_acc_node(m["b"], "B")
-        else:
-            bye_id = f"BYE_B_{state['round']}_{mid}"
-            nodes.append(Node(id=bye_id, label="BYE", size=14))
-            edges.append(Edge(source=bye_id, target=match_node_id, label="B"))
-
-    return nodes, edges
-
-# =========================================================
-# App
-# =========================================================
+# -------------------- UI --------------------
 init_db()
+rules = get_rules()
 
-st.title("Bracket Nodes + Cost Simulator (Stats Game)")
+st.title("Account Fight Simulator (Stats Game)")
+
+# RULES
+with st.expander("Global Rules", expanded=True):
+    c1, c2, c3, c4 = st.columns(4)
+    account_cost = c1.number_input("Account cost (USD)", min_value=0.0, value=rules["account_cost_usd"], step=1.0)
+    reset_cost = c2.number_input("Reset cost (USD)", min_value=0.0, value=rules["reset_cost_usd"], step=1.0)
+    max_resets = c3.number_input("Max resets", min_value=0, value=rules["max_resets"], step=1)
+    auto_del = c4.checkbox("Auto-delete when exhausted", value=rules["auto_delete_on_exhaust"])
+
+    if st.button("Save rules"):
+        set_rules(account_cost, reset_cost, int(max_resets), auto_del)
+        st.success("Saved.")
+        st.rerun()
 
 rules = get_rules()
 
-# ---- Global rules panel
-with st.expander("Global Rules (apply to everyone)", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    fee = c1.number_input("Account fee (USD)", min_value=0.0, value=float(rules["account_fee_usd"]), step=1.0)
-    reset_cost = c2.number_input("Reset cost (USD)", min_value=0.0, value=float(rules["reset_cost_usd"]), step=1.0)
-    max_resets = c3.number_input("Max resets per account", min_value=0, value=int(rules["max_resets"]), step=1)
+# SUMMARY
+acc_df = list_accounts_full()
+if not acc_df.empty:
+    acc_df["resets_remaining"] = rules["max_resets"] - acc_df["resets_used"]
+    total_accounts = len(acc_df)
+    total_fees = total_accounts * rules["account_cost_usd"]
+    total_resets_used = int(acc_df["resets_used"].sum())
+    total_reset_cost = total_resets_used * rules["reset_cost_usd"]
+    total_loss = total_fees + total_reset_cost
+    active_count = int((acc_df["active"] == 1).sum())
+else:
+    total_accounts = active_count = 0
+    total_fees = total_reset_cost = total_loss = 0.0
+    total_resets_used = 0
 
-    if st.button("Save rules"):
-        set_rules(fee, reset_cost, int(max_resets))
-        st.success("Rules saved.")
-        st.rerun()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Participants", len(list_participants()))
+m2.metric("Accounts", total_accounts)
+m3.metric("Active accounts", active_count)
+m4.metric("Total game cost (USD)", f"{total_loss:,.2f}")
 
 st.divider()
 
-# ---- Setup: participants + accounts
-left, right = st.columns([2, 3], gap="large")
+# MAIN LAYOUT
+left, mid, right = st.columns([1.2, 1.6, 1.8], gap="large")
 
+# LEFT: Participants + Shop
 with left:
     st.subheader("Participants")
-    name = st.text_input("Add participant", placeholder="Rene / Friend1 / Friend2")
+    p_name = st.text_input("New participant", placeholder="Rene / Friend1 / Friend2")
     if st.button("Add participant", use_container_width=True):
-        if name.strip():
-            upsert_participant(name.strip())
+        if p_name.strip():
+            add_participant(p_name.strip())
             st.rerun()
 
-    st.subheader("Accounts")
     p_df = list_participants()
-    if len(p_df) == 0:
-        st.info("Add at least one participant.")
+    if p_df.empty:
+        st.info("Add participants to start.")
     else:
-        p = st.selectbox("Participant", p_df["name"].tolist())
-        nick = st.text_input("Account nickname", placeholder="A1 / A2 / B1 ...")
-        if st.button("Add account", use_container_width=True):
-            if nick.strip():
-                add_account(p, nick.strip())
+        st.subheader("Shop")
+        pick = st.selectbox("Select participant", p_df["name"].tolist())
+        pid = int(p_df[p_df["name"] == pick].iloc[0]["id"])
+
+        if st.button(f"Buy account for {pick}", type="primary", use_container_width=True):
+            buy_account(pid, pick)
+            st.rerun()
+
+        if st.button(f"Buy 2 accounts for {pick}", use_container_width=True):
+            buy_account(pid, pick)
+            buy_account(pid, pick)
+            st.rerun()
+
+        with st.expander("Danger zone"):
+            if st.button(f"Delete participant {pick} (and all accounts)", use_container_width=True):
+                delete_participant(pid)
                 st.rerun()
 
+# MID: Accounts table + actions
+with mid:
+    st.subheader("Accounts & Status")
+    df = list_accounts_full()
+    if df.empty:
+        st.info("No accounts yet.")
+    else:
+        df["status"] = df["active"].map(lambda x: "Active" if x == 1 else "Inactive")
+        df["resets_remaining"] = rules["max_resets"] - df["resets_used"]
+        df["delete_ok"] = df["resets_used"] >= rules["max_resets"]
+
+        show = df[["id", "participant", "code", "status", "resets_used", "resets_remaining", "delete_ok"]].copy()
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        st.caption("Quick actions")
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            acc_id = st.number_input("Account ID", min_value=0, value=0, step=1)
+        with a2:
+            if st.button("Toggle Active/Inactive", use_container_width=True, disabled=(acc_id == 0)):
+                # flip
+                row = df[df["id"] == int(acc_id)]
+                if not row.empty:
+                    current = int(row.iloc[0]["active"])
+                    toggle_account_active(int(acc_id), active=(current == 0))
+                    st.rerun()
+        with a3:
+            if st.button("Delete account", use_container_width=True, disabled=(acc_id == 0)):
+                delete_account(int(acc_id))
+                st.rerun()
+
+# RIGHT: Match Center (one-click flow)
 with right:
-    st.subheader("Current accounts")
-    accounts_df = list_accounts()
-    st.dataframe(accounts_df, use_container_width=True, hide_index=True)
+    st.subheader("Match Center (Auto)")
 
-st.divider()
-
-# ---- Tournament controls
-tcol1, tcol2 = st.columns([2, 3], gap="large")
-
-with tcol1:
-    st.subheader("Tournament")
-    tname = st.text_input("New tournament name", placeholder="Feb-Week1")
-    shuffle = st.checkbox("Shuffle seeds", value=True)
-    if st.button("Create tournament from ALL accounts", use_container_width=True, disabled=(len(accounts_df) < 2 or len(tname.strip()) == 0)):
-        tid = create_tournament(tname.strip())
-        state = seed_bracket(accounts_df.to_dict(orient="records"), shuffle=shuffle)
-        init_ledger_if_missing(state, accounts_df.to_dict(orient="records"), get_rules())
-        save_state(tid, state)
-        st.session_state["tid"] = tid
-        st.rerun()
-
-    tdf = list_tournaments()
-    if len(tdf):
-        label_map = {f"#{int(r.id)} • {r.name} ({r.created_at[:10]})": int(r.id) for r in tdf.itertuples()}
-        pick = st.selectbox("Open existing", list(label_map.keys()))
-        if st.button("Open selected", type="secondary", use_container_width=True):
-            st.session_state["tid"] = label_map[pick]
-            st.rerun()
-    else:
-        st.info("No tournaments yet.")
-
-with tcol2:
-    tid = st.session_state.get("tid")
-    if not tid:
-        st.info("Create or open a tournament.")
-    else:
-        state = load_state(tid)
-        if not state:
-            st.warning("No saved state.")
+    # Ensure we have an open match; if not, create one.
+    open_match = get_latest_open_match()
+    if open_match is None:
+        a, b = pick_next_match(rules)
+        if a is None or b is None:
+            st.warning("Not enough eligible active accounts from different participants.")
         else:
-            # ensure ledger exists for all accounts ever used
-            all_accounts = accounts_df.to_dict(orient="records")
-            init_ledger_if_missing(state, all_accounts, get_rules())
+            session = st.session_state.get("session_name")
+            if not session:
+                session = gen_session_name()
+                st.session_state["session_name"] = session
 
-            # ---- Summary (loss/cost)
-            ledger = state["ledger"]
-            df_led = pd.DataFrame([{
-                "account_id": int(aid),
-                "participant": rec["participant"],
-                "nickname": rec["nickname"],
-                "status": rec["status"],
-                "resets_used": rec["resets_used"],
-                "loss_usd": rec["loss_usd"],
-            } for aid, rec in ledger.items()])
+            create_match(session, int(a["id"]), int(b["id"]))
+            open_match = get_latest_open_match()
 
-            # Totals
-            total_loss = float(df_led["loss_usd"].sum()) if len(df_led) else 0.0
-            total_resets_cost = float(df_led["resets_used"].sum()) * float(get_rules()["reset_cost_usd"])
-            total_fees = len(df_led) * float(get_rules()["account_fee_usd"])
+    if open_match is not None:
+        st.write(f"Session: **{open_match['session_name']}**")
+        st.write(f"Match created: {open_match['created_at']}")
 
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Accounts in ledger", len(df_led))
-            s2.metric("Total Fees (USD)", f"{total_fees:,.2f}")
-            s3.metric("Total Reset Cost (USD)", f"{total_resets_cost:,.2f}")
-            s4.metric("Total Loss (USD)", f"{total_loss:,.2f}")
+        pair = accounts_by_id([int(open_match["a_account_id"]), int(open_match["b_account_id"])])
+        if len(pair) < 2:
+            st.warning("One of the accounts no longer exists. Creating a new match…")
+            # mark this match as resolved with nulls (or just ignore) and rerun
+            resolve_match(int(open_match["id"]), 0, 0)
+            st.rerun()
 
-            st.caption("Per participant")
-            byp = df_led.groupby("participant", as_index=False).agg(
-                accounts=("account_id", "count"),
-                loss_usd=("loss_usd", "sum"),
-                resets_used=("resets_used", "sum"),
-            ).sort_values("loss_usd", ascending=False)
-            st.dataframe(byp, use_container_width=True, hide_index=True)
+        # Build UI cards
+        pair = pair.set_index("id")
+        a_id = int(open_match["a_account_id"])
+        b_id = int(open_match["b_account_id"])
 
-            st.divider()
+        a_row = pair.loc[a_id]
+        b_row = pair.loc[b_id]
 
-            # ---- Node graph for current round
-            if state.get("completed"):
-                st.success("Tournament completed.")
-                st.dataframe(df_led.sort_values(["participant","nickname"]), use_container_width=True, hide_index=True)
-            else:
-                st.subheader(f"Round {state['round']} – Node Bracket")
-                nodes, edges = make_graph_for_round(state)
+        a_resets_rem = rules["max_resets"] - int(a_row["resets_used"])
+        b_resets_rem = rules["max_resets"] - int(b_row["resets_used"])
 
-                config = Config(
-                    width="100%",
-                    height=520,
-                    directed=True,
-                    physics=False,
-                    hierarchical=True
-                )
+        cA, cB = st.columns(2, gap="large")
 
-                selected = agraph(nodes=nodes, edges=edges, config=config)
-                st.caption("Click an account node, then pick the match and set winner.")
+        with cA:
+            st.markdown(f"### {a_row['participant']}")
+            st.markdown(f"**{a_row['code']}**  (#{a_id})")
+            st.write(f"Resets remaining: **{a_resets_rem}**")
+            st.write(f"Status: **{'Active' if int(a_row['active'])==1 else 'Inactive'}**")
 
-                # Controls to set winner
-                matches = state["matches"]
-                match_options = []
-                for m in matches:
-                    a = m["a"]; b = m["b"]
-                    if a is None or b is None:
-                        continue
-                    match_options.append(f"Match {m['match_id']}: A#{a['id']} vs B#{b['id']}")
-                if len(match_options) == 0:
-                    st.info("No selectable matches (BYEs only). Click **Build next round**.")
-                else:
-                    sel_match_label = st.selectbox("Select match to resolve", match_options)
-                    match_id = int(sel_match_label.split(":")[0].split()[1])
+            if st.button("✅ A WINS", use_container_width=True, type="primary"):
+                # loser is B
+                resolve_match(int(open_match["id"]), a_id, b_id)
+                apply_loss_to_loser(b_id, rules)
+                # auto-create next match immediately
+                st.rerun()
 
-                    # Parse selected node id -> account id
-                    selected_account_id = None
-                    if isinstance(selected, dict) and "id" in selected and str(selected["id"]).startswith("A"):
-                        try:
-                            selected_account_id = int(str(selected["id"])[1:])
-                        except:
-                            selected_account_id = None
+        with cB:
+            st.markdown(f"### {b_row['participant']}")
+            st.markdown(f"**{b_row['code']}**  (#{b_id})")
+            st.write(f"Resets remaining: **{b_resets_rem}**")
+            st.write(f"Status: **{'Active' if int(b_row['active'])==1 else 'Inactive'}**")
 
-                    st.write(f"Selected node account id: **{selected_account_id if selected_account_id else '—'}**")
+            if st.button("✅ B WINS", use_container_width=True, type="primary"):
+                # loser is A
+                resolve_match(int(open_match["id"]), b_id, a_id)
+                apply_loss_to_loser(a_id, rules)
+                st.rerun()
 
-                    if st.button("Set selected node as winner", type="primary", use_container_width=True, disabled=(selected_account_id is None)):
-                        rules_now = get_rules()
-                        # find match
-                        for m in state["matches"]:
-                            if m["match_id"] != match_id:
-                                continue
-                            a = m["a"]; b = m["b"]
-                            if not a or not b:
-                                continue
-                            if selected_account_id not in (a["id"], b["id"]):
-                                st.error("Selected account is not part of that match.")
-                                break
-
-                            winner_id = selected_account_id
-                            loser_id = b["id"] if winner_id == a["id"] else a["id"]
-
-                            # Apply "loser reset cost" for the stats game
-                            apply_loss_to_loser(state, loser_id, rules_now)
-
-                            m["winner_id"] = winner_id
-                            m["loser_id"] = loser_id
-                            save_state(tid, state)
-                            st.success(f"Saved: winner #{winner_id}, loser #{loser_id} (loser incurred reset rule).")
-                            st.rerun()
-
-                cbtn1, cbtn2 = st.columns([2, 2])
-                with cbtn1:
-                    if st.button("Build next round", use_container_width=True):
-                        state = build_next_round(state)
-                        save_state(tid, state)
-                        st.rerun()
-                with cbtn2:
-                    if st.button("Save state", type="secondary", use_container_width=True):
-                        save_state(tid, state)
-                        st.success("Saved.")
-                        st.rerun()
-
-            st.divider()
-
-            # Export/Import state
-            st.subheader("Export / Import")
-            export_payload = {"rules": get_rules(), "tournament_id": tid, "state": state}
-            st.download_button(
-                "Download tournament JSON",
-                data=json.dumps(export_payload, indent=2),
-                file_name=f"tournament_{tid}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-
-            upl = st.file_uploader("Import tournament JSON", type=["json"])
-            if upl is not None:
-                try:
-                    payload = json.loads(upl.read().decode("utf-8"))
-                    if "state" not in payload:
-                        st.error("Invalid file.")
-                    else:
-                        save_state(tid, payload["state"])
-                        st.success("Imported and saved.")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Import failed: {e}")
+        st.divider()
+        st.caption("Recent results")
+        conn = db()
+        hist = pd.read_sql_query("""
+          SELECT id, session_name, a_account_id, b_account_id, winner_account_id, loser_account_id, resolved_at
+          FROM matches
+          WHERE resolved_at IS NOT NULL
+          ORDER BY id DESC
+          LIMIT 15
+        """, conn)
+        conn.close()
+        st.dataframe(hist, use_container_width=True, hide_index=True)
