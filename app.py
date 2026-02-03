@@ -1,18 +1,19 @@
-# app.py
+import os
 import sqlite3
 from datetime import datetime
-import random
-import string
-from typing import Optional, Tuple, Set
+from typing import Set, Optional
 
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Account Simulator (Stats Game)", layout="wide")
+# =========================================================
+# CONFIG
+# =========================================================
+st.set_page_config(page_title="Account Stats Game", layout="wide")
 DB_PATH = "account_game.db"
 
 # =========================================================
-# DB helpers
+# DB UTILS
 # =========================================================
 def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -24,23 +25,21 @@ def get_table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
     return set(r[1] for r in rows)
 
 def safe_add_column(conn: sqlite3.Connection, table: str, coldef: str):
-    # coldef like: "phase TEXT NOT NULL DEFAULT 'Eval'"
-    colname = coldef.split()[0]
-    cols = get_table_columns(conn, table)
-    if colname not in cols:
+    col = coldef.split()[0]
+    if col not in get_table_columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {coldef};")
 
-def ensure_rules_row(conn: sqlite3.Connection):
-    conn.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
+def now_iso():
+    return datetime.utcnow().isoformat(timespec="seconds")
 
 # =========================================================
-# INIT + MIGRATIONS
+# INIT (FRESH SCHEMA)
 # =========================================================
-def init_db():
+def init_db_fresh():
+    """Create fresh schema (assumes DB file is new/empty)."""
     conn = db()
     cur = conn.cursor()
 
-    # ------------------ RULES ------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS rules(
       id INTEGER PRIMARY KEY CHECK(id=1),
@@ -49,20 +48,12 @@ def init_db():
       max_resets        INTEGER NOT NULL DEFAULT 5,
       win_amount_usd    REAL    NOT NULL DEFAULT 4500,
       pro_threshold_usd REAL    NOT NULL DEFAULT 9000,
-      cushion_usd       REAL    NOT NULL DEFAULT 4500
+      cushion_usd       REAL    NOT NULL DEFAULT 4500,
+      max_pro_accounts  INTEGER NOT NULL DEFAULT 5
     );
     """)
-    ensure_rules_row(conn)
+    cur.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
 
-    # Migrate rules for older DBs
-    safe_add_column(conn, "rules", "account_cost_usd REAL NOT NULL DEFAULT 216")
-    safe_add_column(conn, "rules", "reset_cost_usd REAL NOT NULL DEFAULT 100")
-    safe_add_column(conn, "rules", "max_resets INTEGER NOT NULL DEFAULT 5")
-    safe_add_column(conn, "rules", "win_amount_usd REAL NOT NULL DEFAULT 4500")
-    safe_add_column(conn, "rules", "pro_threshold_usd REAL NOT NULL DEFAULT 9000")
-    safe_add_column(conn, "rules", "cushion_usd REAL NOT NULL DEFAULT 4500")
-
-    # ------------------ PARTICIPANTS ------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS participants(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,8 +62,104 @@ def init_db():
     );
     """)
 
-    # ------------------ ACCOUNTS ------------------
-    # Create minimal (older DB might exist already)
+    # NOTE:
+    # - balance_usd is "virtual game balance"
+    # - spend is real money: purchase_paid_usd + resets_paid_usd
+    # - withdrawals table is real money events you record manually
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS accounts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      participant_id INTEGER NOT NULL,
+      code TEXT NOT NULL,
+
+      phase TEXT NOT NULL DEFAULT 'Eval',         -- Eval / Pro
+      active INTEGER NOT NULL DEFAULT 1,          -- 1 active, 0 inactive
+      blown INTEGER NOT NULL DEFAULT 0,           -- 1 means dead forever (Pro blow)
+
+      resets_used INTEGER NOT NULL DEFAULT 0,
+      purchase_paid_usd REAL NOT NULL DEFAULT 0,
+      resets_paid_usd REAL NOT NULL DEFAULT 0,
+
+      balance_usd REAL NOT NULL DEFAULT 0,        -- virtual
+      withdrawable_usd REAL NOT NULL DEFAULT 0,   -- virtual, Pro only
+
+      created_at TEXT NOT NULL,
+
+      FOREIGN KEY(participant_id) REFERENCES participants(id)
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS withdrawals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      participant_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+
+      percent REAL NOT NULL,
+      base_amount_usd REAL NOT NULL,
+      amount_usd REAL NOT NULL,
+
+      created_at TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+
+      FOREIGN KEY(participant_id) REFERENCES participants(id),
+      FOREIGN KEY(account_id) REFERENCES accounts(id)
+    );
+    """)
+
+    # Tournament engine: manual match creation + resolution
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS matches(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      a_account_id INTEGER NOT NULL,
+      b_account_id INTEGER NOT NULL,
+
+      winner_account_id INTEGER NULL,
+      loser_account_id INTEGER NULL,
+
+      created_at TEXT NOT NULL,
+      resolved_at TEXT NULL,
+
+      note TEXT NOT NULL DEFAULT ''
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+
+def init_db_with_migrations():
+    """
+    Create base tables if missing, and migrate columns if you ever update the app again.
+    Since you asked to reset DB now, you likely won't need this,
+    but leaving it here makes the app robust.
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rules(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      account_cost_usd  REAL    NOT NULL DEFAULT 216,
+      reset_cost_usd    REAL    NOT NULL DEFAULT 100,
+      max_resets        INTEGER NOT NULL DEFAULT 5,
+      win_amount_usd    REAL    NOT NULL DEFAULT 4500
+    );
+    """)
+    cur.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
+
+    # migrate rules
+    safe_add_column(conn, "rules", "pro_threshold_usd REAL NOT NULL DEFAULT 9000")
+    safe_add_column(conn, "rules", "cushion_usd REAL NOT NULL DEFAULT 4500")
+    safe_add_column(conn, "rules", "max_pro_accounts INTEGER NOT NULL DEFAULT 5")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS participants(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
+    );
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS accounts(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,34 +175,11 @@ def init_db():
     );
     """)
 
-    # Migrate accounts for older DBs (these are SAFE to run always)
-    safe_add_column(conn, "accounts", "active INTEGER NOT NULL DEFAULT 1")
-    safe_add_column(conn, "accounts", "resets_used INTEGER NOT NULL DEFAULT 0")
-    safe_add_column(conn, "accounts", "purchase_paid_usd REAL NOT NULL DEFAULT 0")
-    safe_add_column(conn, "accounts", "resets_paid_usd REAL NOT NULL DEFAULT 0")
-    safe_add_column(conn, "accounts", "balance_usd REAL NOT NULL DEFAULT 0")
-    safe_add_column(conn, "accounts", "created_at TEXT NOT NULL DEFAULT ''")
-
-    # New features
+    # migrate accounts
     safe_add_column(conn, "accounts", "phase TEXT NOT NULL DEFAULT 'Eval'")
     safe_add_column(conn, "accounts", "blown INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "accounts", "withdrawable_usd REAL NOT NULL DEFAULT 0")
 
-    # ------------------ MATCHES ------------------
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS matches(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_name TEXT NOT NULL,
-      a_account_id INTEGER NOT NULL,
-      b_account_id INTEGER NOT NULL,
-      winner_account_id INTEGER NULL,
-      loser_account_id INTEGER NULL,
-      created_at TEXT NOT NULL,
-      resolved_at TEXT NULL
-    );
-    """)
-
-    # ------------------ WITHDRAWALS ------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS withdrawals(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,34 +195,33 @@ def init_db():
     );
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS matches(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      a_account_id INTEGER NOT NULL,
+      b_account_id INTEGER NOT NULL,
+      winner_account_id INTEGER NULL,
+      loser_account_id INTEGER NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT NULL,
+      note TEXT NOT NULL DEFAULT ''
+    );
+    """)
+
     conn.commit()
     conn.close()
 
 # =========================================================
-# Rules
+# RULES
 # =========================================================
 def get_rules():
     conn = db()
-    ensure_rules_row(conn)
-
-    # If an old DB is missing columns, return safe defaults
-    cols = get_table_columns(conn, "rules")
-    def col_or_default(name: str, default_sql: str):
-        return name if name in cols else f"{default_sql} AS {name}"
-
-    q = f"""
-      SELECT
-        {col_or_default("account_cost_usd", "216")},
-        {col_or_default("reset_cost_usd", "100")},
-        {col_or_default("max_resets", "5")},
-        {col_or_default("win_amount_usd", "4500")},
-        {col_or_default("pro_threshold_usd", "9000")},
-        {col_or_default("cushion_usd", "4500")}
+    row = conn.execute("""
+      SELECT account_cost_usd, reset_cost_usd, max_resets, win_amount_usd,
+             pro_threshold_usd, cushion_usd, max_pro_accounts
       FROM rules WHERE id=1
-    """
-    row = conn.execute(q).fetchone()
+    """).fetchone()
     conn.close()
-
     return {
         "account_cost_usd": float(row[0]),
         "reset_cost_usd": float(row[1]),
@@ -166,31 +229,39 @@ def get_rules():
         "win_amount_usd": float(row[3]),
         "pro_threshold_usd": float(row[4]),
         "cushion_usd": float(row[5]),
+        "max_pro_accounts": int(row[6]),
     }
 
-def set_rules(account_cost_usd, reset_cost_usd, max_resets, win_amount_usd, pro_threshold_usd, cushion_usd):
+def set_rules(r):
     conn = db()
     conn.execute("""
-      UPDATE rules
-      SET account_cost_usd=?, reset_cost_usd=?, max_resets=?, win_amount_usd=?, pro_threshold_usd=?, cushion_usd=?
+      UPDATE rules SET
+        account_cost_usd=?,
+        reset_cost_usd=?,
+        max_resets=?,
+        win_amount_usd=?,
+        pro_threshold_usd=?,
+        cushion_usd=?,
+        max_pro_accounts=?
       WHERE id=1
     """, (
-        float(account_cost_usd),
-        float(reset_cost_usd),
-        int(max_resets),
-        float(win_amount_usd),
-        float(pro_threshold_usd),
-        float(cushion_usd),
+        float(r["account_cost_usd"]),
+        float(r["reset_cost_usd"]),
+        int(r["max_resets"]),
+        float(r["win_amount_usd"]),
+        float(r["pro_threshold_usd"]),
+        float(r["cushion_usd"]),
+        int(r["max_pro_accounts"]),
     ))
     conn.commit()
     conn.close()
 
 # =========================================================
-# Participants
+# PARTICIPANTS
 # =========================================================
 def list_participants():
     conn = db()
-    df = pd.read_sql_query("SELECT id, name FROM participants ORDER BY name", conn)
+    df = pd.read_sql_query("SELECT id, name, created_at FROM participants ORDER BY name", conn)
     conn.close()
     return df
 
@@ -199,142 +270,117 @@ def add_participant(name: str):
     if not name:
         return
     conn = db()
-    conn.execute(
-        "INSERT OR IGNORE INTO participants(name, created_at) VALUES(?, ?)",
-        (name, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-def delete_participant(pid: int):
-    conn = db()
-    conn.execute("DELETE FROM withdrawals WHERE participant_id=?", (int(pid),))
-    conn.execute("DELETE FROM accounts WHERE participant_id=?", (int(pid),))
-    conn.execute("DELETE FROM participants WHERE id=?", (int(pid),))
+    conn.execute("INSERT OR IGNORE INTO participants(name, created_at) VALUES(?, ?)", (name, now_iso()))
     conn.commit()
     conn.close()
 
 # =========================================================
-# Accounts
+# ACCOUNTS
 # =========================================================
 def next_account_code(pid: int, pname: str) -> str:
-    prefix = "".join([c for c in (pname or "").upper() if c.isalnum()])[:3]
-    prefix = prefix if prefix else f"P{pid}"
+    prefix = "".join([c for c in (pname or "").upper() if c.isalnum()])[:3] or f"P{pid}"
     conn = db()
-    n = conn.execute("SELECT COUNT(*) FROM accounts WHERE participant_id=?", (int(pid),)).fetchone()[0]
+    n = conn.execute("SELECT COUNT(*) FROM accounts WHERE participant_id=?", (pid,)).fetchone()[0]
     conn.close()
     return f"{prefix}-{n+1:04d}"
 
 def buy_account(pid: int, pname: str, rules: dict):
     code = next_account_code(pid, pname)
     conn = db()
-    cols = get_table_columns(conn, "accounts")
-
-    # Insert only columns that exist (super safe with old DBs)
-    fields = ["participant_id", "code"]
-    values = [int(pid), code]
-
-    def add_if(col, val):
-        if col in cols:
-            fields.append(col)
-            values.append(val)
-
-    add_if("active", 1)
-    add_if("resets_used", 0)
-    add_if("purchase_paid_usd", float(rules["account_cost_usd"]))
-    add_if("resets_paid_usd", 0.0)
-    add_if("balance_usd", 0.0)
-    add_if("phase", "Eval")
-    add_if("blown", 0)
-    add_if("withdrawable_usd", 0.0)
-    add_if("created_at", datetime.utcnow().isoformat())
-
-    q = f"INSERT INTO accounts({', '.join(fields)}) VALUES({', '.join(['?']*len(fields))})"
-    conn.execute(q, values)
+    conn.execute("""
+      INSERT INTO accounts(participant_id, code, phase, active, blown, resets_used,
+                           purchase_paid_usd, resets_paid_usd, balance_usd, withdrawable_usd, created_at)
+      VALUES(?, ?, 'Eval', 1, 0, 0, ?, 0, 0, 0, ?)
+    """, (pid, code, float(rules["account_cost_usd"]), now_iso()))
     conn.commit()
     conn.close()
 
 def list_accounts_full():
     conn = db()
-    cols = get_table_columns(conn, "accounts")
-
-    def sel(col: str, default_sql: str):
-        return f"a.{col}" if col in cols else f"{default_sql} AS {col}"
-
-    q = f"""
-      SELECT
-        a.id,
-        p.name AS participant,
-        p.id   AS participant_id,
-        a.code,
-        {sel("active", "1")},
-        {sel("phase", "'Eval'")},
-        {sel("blown", "0")},
-        {sel("resets_used", "0")},
-        {sel("purchase_paid_usd", "0")},
-        {sel("resets_paid_usd", "0")},
-        {sel("balance_usd", "0")},
-        {sel("withdrawable_usd", "0")},
-        {sel("created_at", "''")}
+    df = pd.read_sql_query("""
+      SELECT a.id,
+             p.name AS participant,
+             p.id   AS participant_id,
+             a.code,
+             a.phase,
+             a.active,
+             a.blown,
+             a.resets_used,
+             a.purchase_paid_usd,
+             a.resets_paid_usd,
+             a.balance_usd,
+             a.withdrawable_usd,
+             a.created_at
       FROM accounts a
       JOIN participants p ON p.id=a.participant_id
       ORDER BY p.name, a.id DESC
-    """
-    df = pd.read_sql_query(q, conn)
+    """, conn)
     conn.close()
     return df
 
-def delete_account(account_id: int):
+def count_pro_active(rules: dict) -> int:
     conn = db()
-    conn.execute("DELETE FROM withdrawals WHERE account_id=?", (int(account_id),))
-    conn.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
-    conn.commit()
+    n = conn.execute("""
+      SELECT COUNT(*) FROM accounts
+      WHERE phase='Pro' AND blown=0
+    """).fetchone()[0]
     conn.close()
-
-def promote_if_needed(account_id: int, rules: dict):
-    conn = db()
-    cur = conn.cursor()
-    row = cur.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (int(account_id),)).fetchone()
-    if not row:
-        conn.close()
-        return
-    phase, bal, blown = row[0], float(row[1]), int(row[2])
-    if blown == 1:
-        conn.close()
-        return
-    if phase == "Eval" and bal >= float(rules["pro_threshold_usd"]):
-        cur.execute("UPDATE accounts SET phase='Pro' WHERE id=?", (int(account_id),))
-        conn.commit()
-    conn.close()
+    return int(n)
 
 def recompute_withdrawable(account_id: int, rules: dict):
     conn = db()
     cur = conn.cursor()
-    row = cur.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+    row = cur.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (account_id,)).fetchone()
     if not row:
         conn.close()
         return
     phase, bal, blown = row[0], float(row[1]), int(row[2])
 
-    if blown == 1:
+    if blown == 1 or phase != "Pro":
         wd = 0.0
-    elif phase == "Pro":
-        wd = max(0.0, bal - float(rules["cushion_usd"]))
     else:
-        wd = 0.0
+        wd = max(0.0, bal - float(rules["cushion_usd"]))
 
-    cur.execute("UPDATE accounts SET withdrawable_usd=? WHERE id=?", (wd, int(account_id)))
+    cur.execute("UPDATE accounts SET withdrawable_usd=? WHERE id=?", (wd, account_id))
     conn.commit()
     conn.close()
 
-def manual_reset_account(account_id: int, rules: dict) -> str:
+def can_promote_to_pro(account_id: int, rules: dict) -> (bool, str):
+    """Manual promotion only, cap max_pro_accounts."""
+    if count_pro_active(rules) >= rules["max_pro_accounts"]:
+        return False, f"Pro cap reached ({rules['max_pro_accounts']})."
+    conn = db()
+    row = conn.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (account_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False, "Account not found."
+    phase, bal, blown = row[0], float(row[1]), int(row[2])
+    if blown == 1:
+        return False, "Account is blown."
+    if phase != "Eval":
+        return False, "Account is already Pro."
+    if bal < rules["pro_threshold_usd"]:
+        return False, f"Balance must be >= {rules['pro_threshold_usd']:,.0f} to promote."
+    return True, "OK"
+
+def promote_to_pro(account_id: int, rules: dict) -> str:
+    ok, msg = can_promote_to_pro(account_id, rules)
+    if not ok:
+        return msg
+    conn = db()
+    conn.execute("UPDATE accounts SET phase='Pro' WHERE id=?", (account_id,))
+    conn.commit()
+    conn.close()
+    recompute_withdrawable(account_id, rules)
+    return "Promoted to Pro."
+
+def manual_reset_eval(account_id: int, rules: dict) -> str:
     conn = db()
     cur = conn.cursor()
     row = cur.execute("""
       SELECT phase, blown, active, resets_used
-      FROM accounts
-      WHERE id=?
-    """, (int(account_id),)).fetchone()
+      FROM accounts WHERE id=?
+    """, (account_id,)).fetchone()
     if not row:
         conn.close()
         return "Account not found."
@@ -343,16 +389,16 @@ def manual_reset_account(account_id: int, rules: dict) -> str:
 
     if blown == 1:
         conn.close()
-        return "This account is blown and cannot be reset."
+        return "Account is blown and cannot be reset."
     if phase != "Eval":
         conn.close()
         return "Pro accounts cannot be reset."
     if active == 1:
         conn.close()
-        return "Account is already Active. Reset applies only to Inactive accounts."
-    if resets_used >= int(rules["max_resets"]):
+        return "Account is already active."
+    if resets_used >= rules["max_resets"]:
         conn.close()
-        return f"No resets remaining (used {resets_used}/{rules['max_resets']})."
+        return f"No resets left ({resets_used}/{rules['max_resets']})."
 
     resets_used += 1
     cur.execute("""
@@ -362,15 +408,15 @@ def manual_reset_account(account_id: int, rules: dict) -> str:
           active=1,
           balance_usd=0
       WHERE id=?
-    """, (resets_used, float(rules["reset_cost_usd"]), int(account_id)))
-
+    """, (resets_used, float(rules["reset_cost_usd"]), account_id))
     conn.commit()
     conn.close()
+
     recompute_withdrawable(account_id, rules)
-    return f"Reset applied. Resets used: {resets_used}/{rules['max_resets']}"
+    return f"Reset done. Used {resets_used}/{rules['max_resets']}."
 
 # =========================================================
-# Withdrawals
+# WITHDRAWALS (REAL MONEY EVENTS YOU RECORD)
 # =========================================================
 def withdrawals_df():
     conn = db()
@@ -393,51 +439,67 @@ def withdrawals_df():
 
 def record_withdrawal(participant_id: int, account_id: int, percent: float, base_amount: float, note: str, rules: dict) -> str:
     amount = float(percent) * float(base_amount)
-
     conn = db()
     cur = conn.cursor()
-    row = cur.execute("SELECT phase, blown, withdrawable_usd FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+
+    row = cur.execute("SELECT phase, blown, withdrawable_usd FROM accounts WHERE id=?", (account_id,)).fetchone()
     if not row:
         conn.close()
         return "Account not found."
-    phase, blown, withdrawable = row[0], int(row[1]), float(row[2])
+    phase, blown, wd = row[0], int(row[1]), float(row[2])
 
     if blown == 1:
         conn.close()
         return "Account is blown."
     if phase != "Pro":
         conn.close()
-        return "Only Pro accounts can record withdrawals."
-    if amount > withdrawable:
+        return "Only Pro accounts can withdraw."
+    if amount > wd:
         conn.close()
-        return f"Not enough withdrawable. Need {amount:,.2f}, available {withdrawable:,.2f}"
+        return f"Not enough withdrawable. Need {amount:,.2f}, available {wd:,.2f}"
 
     cur.execute("""
       INSERT INTO withdrawals(participant_id, account_id, percent, base_amount_usd, amount_usd, created_at, note)
       VALUES(?, ?, ?, ?, ?, ?, ?)
-    """, (int(participant_id), int(account_id), float(percent), float(base_amount),
-          float(amount), datetime.utcnow().isoformat(), (note or "").strip()))
+    """, (participant_id, account_id, float(percent), float(base_amount), float(amount), now_iso(), (note or "").strip()))
 
-    # Reduce virtual balance to reflect payout
-    cur.execute("UPDATE accounts SET balance_usd = balance_usd - ? WHERE id=?", (float(amount), int(account_id)))
+    # Reduce virtual balance to represent payout taken
+    cur.execute("UPDATE accounts SET balance_usd = balance_usd - ? WHERE id=?", (float(amount), account_id))
 
     conn.commit()
     conn.close()
+
     recompute_withdrawable(account_id, rules)
-    return f"Recorded withdrawal: {amount:,.2f} USD"
+    return f"Withdrawal recorded: {amount:,.2f} USD"
 
 # =========================================================
-# Matches
+# TOURNAMENT ENGINE (MANUAL MATCH SELECTION)
 # =========================================================
-def gen_session_name():
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    rnd = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    return f"SESSION-{stamp}-{rnd}"
+def create_match(a_id: int, b_id: int, note: str = "") -> str:
+    if a_id == b_id:
+        return "Pick two different accounts."
+    conn = db()
+    # Ensure both exist and are eligible
+    rowA = conn.execute("SELECT active, blown FROM accounts WHERE id=?", (a_id,)).fetchone()
+    rowB = conn.execute("SELECT active, blown FROM accounts WHERE id=?", (b_id,)).fetchone()
+    if not rowA or not rowB:
+        conn.close()
+        return "Account not found."
+    if int(rowA[0]) != 1 or int(rowB[0]) != 1 or int(rowA[1]) == 1 or int(rowB[1]) == 1:
+        conn.close()
+        return "Both accounts must be Active and not Blown."
+    conn.execute("""
+      INSERT INTO matches(a_account_id, b_account_id, created_at, note)
+      VALUES(?, ?, ?, ?)
+    """, (a_id, b_id, now_iso(), (note or "").strip()))
+    conn.commit()
+    conn.close()
+    return "Match created."
 
-def get_latest_open_match():
+def get_open_match() -> Optional[pd.Series]:
     conn = db()
     df = pd.read_sql_query("""
-      SELECT id, session_name, a_account_id, b_account_id, created_at
+      SELECT id, a_account_id, b_account_id, created_at, note
       FROM matches
       WHERE resolved_at IS NULL
       ORDER BY id DESC
@@ -446,66 +508,36 @@ def get_latest_open_match():
     conn.close()
     return None if df.empty else df.iloc[0]
 
-def create_match(session_name: str, a_id: int, b_id: int):
-    conn = db()
-    conn.execute("""
-      INSERT INTO matches(session_name, a_account_id, b_account_id, created_at)
-      VALUES(?, ?, ?, ?)
-    """, (session_name, int(a_id), int(b_id), datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-def pick_next_match(rules: dict) -> Tuple[Optional[pd.Series], Optional[pd.Series]]:
-    df = list_accounts_full()
-    if df.empty:
-        return None, None
-    df = df[(df["active"] == 1) & (df["blown"] == 0)]
-    if len(df) < 2:
-        return None, None
-
-    participants = df["participant"].unique().tolist()
-    if len(participants) < 2:
-        return None, None
-
-    p1 = random.choice(participants)
-    p2 = random.choice([p for p in participants if p != p1])
-
-    a = df[df["participant"] == p1].sample(1).iloc[0]
-    b = df[df["participant"] == p2].sample(1).iloc[0]
-    return a, b
-
-def resolve_match_apply(match_id: int, winner_id: int, loser_id: int, rules: dict):
+def resolve_match(match_id: int, winner_id: int, loser_id: int, rules: dict) -> str:
     win_amt = float(rules["win_amount_usd"])
-
     conn = db()
     cur = conn.cursor()
 
-    # Winner +4500
+    # Winner +4500 virtual
     cur.execute("""
       UPDATE accounts
-      SET balance_usd = balance_usd + ?,
-          active = 1
+      SET balance_usd = balance_usd + ?
       WHERE id=?
-    """, (win_amt, int(winner_id)))
+    """, (win_amt, winner_id))
 
-    # Loser -4500
-    loser_row = cur.execute("SELECT phase, balance_usd FROM accounts WHERE id=?", (int(loser_id),)).fetchone()
-    if not loser_row:
+    # Loser -4500 virtual
+    loser = cur.execute("SELECT phase, balance_usd FROM accounts WHERE id=?", (loser_id,)).fetchone()
+    if not loser:
         conn.close()
-        return
-    loser_phase = loser_row[0]
-    loser_balance_after = float(loser_row[1]) - win_amt
+        return "Loser account not found."
+    loser_phase = loser[0]
+    loser_balance_after = float(loser[1]) - win_amt
 
     if loser_phase == "Eval":
-        # Eval: inactive until manual reset
+        # Eval loses => inactive until manual reset
         cur.execute("""
           UPDATE accounts
           SET balance_usd = balance_usd - ?,
               active = 0
           WHERE id=?
-        """, (win_amt, int(loser_id)))
+        """, (win_amt, loser_id))
     else:
-        # Pro: blown if balance goes below 0
+        # Pro loses: blow only if below 0 (you can change to below cushion if you want)
         if loser_balance_after < 0:
             cur.execute("""
               UPDATE accounts
@@ -513,36 +545,37 @@ def resolve_match_apply(match_id: int, winner_id: int, loser_id: int, rules: dic
                   active = 0,
                   blown = 1
               WHERE id=?
-            """, (win_amt, int(loser_id)))
+            """, (win_amt, loser_id))
         else:
             cur.execute("""
               UPDATE accounts
-              SET balance_usd = balance_usd - ?,
-                  active = 1
+              SET balance_usd = balance_usd - ?
               WHERE id=?
-            """, (win_amt, int(loser_id)))
+            """, (win_amt, loser_id))
 
     # Close match
     cur.execute("""
       UPDATE matches
-      SET winner_account_id=?, loser_account_id=?, resolved_at=?
+      SET winner_account_id=?,
+          loser_account_id=?,
+          resolved_at=?
       WHERE id=?
-    """, (int(winner_id), int(loser_id), datetime.utcnow().isoformat(), int(match_id)))
+    """, (winner_id, loser_id, now_iso(), match_id))
 
     conn.commit()
     conn.close()
 
-    promote_if_needed(winner_id, rules)
-    promote_if_needed(loser_id, rules)
+    # Recompute withdrawable for both
     recompute_withdrawable(winner_id, rules)
     recompute_withdrawable(loser_id, rules)
 
-def recent_matches(limit=25):
+    return "Match resolved."
+
+def matches_df(limit=50):
     conn = db()
     df = pd.read_sql_query(f"""
-      SELECT id, session_name, a_account_id, b_account_id, winner_account_id, loser_account_id, resolved_at
+      SELECT *
       FROM matches
-      WHERE resolved_at IS NOT NULL
       ORDER BY id DESC
       LIMIT {int(limit)}
     """, conn)
@@ -550,247 +583,372 @@ def recent_matches(limit=25):
     return df
 
 # =========================================================
-# UI
+# SUMMARY HELPERS
 # =========================================================
-init_db()
+def global_summary(acc: pd.DataFrame, wd: pd.DataFrame):
+    if acc.empty:
+        return {
+            "accounts_total": 0,
+            "spend": 0.0,
+            "withdrawn": 0.0,
+            "net": 0.0,
+            "active": 0,
+            "inactive": 0,
+            "blown": 0,
+            "eval_active": 0,
+            "eval_inactive": 0,
+            "pro_active": 0,
+            "pro_blown": 0,
+            "resets_used_total": 0,
+        }
+
+    spend = float((acc["purchase_paid_usd"].astype(float) + acc["resets_paid_usd"].astype(float)).sum())
+    withdrawn = float(wd["amount_usd"].sum()) if not wd.empty else 0.0
+    net = withdrawn - spend
+
+    active = int((acc["active"].astype(int) == 1).sum())
+    inactive = int((acc["active"].astype(int) == 0).sum())
+    blown = int((acc["blown"].astype(int) == 1).sum())
+
+    eval_active = int(((acc["phase"] == "Eval") & (acc["active"].astype(int) == 1) & (acc["blown"].astype(int) == 0)).sum())
+    eval_inactive = int(((acc["phase"] == "Eval") & (acc["active"].astype(int) == 0) & (acc["blown"].astype(int) == 0)).sum())
+    pro_active = int(((acc["phase"] == "Pro") & (acc["blown"].astype(int) == 0)).sum())
+    pro_blown = int(((acc["phase"] == "Pro") & (acc["blown"].astype(int) == 1)).sum())
+    resets_used_total = int(acc["resets_used"].astype(int).sum())
+
+    return {
+        "accounts_total": len(acc),
+        "spend": spend,
+        "withdrawn": withdrawn,
+        "net": net,
+        "active": active,
+        "inactive": inactive,
+        "blown": blown,
+        "eval_active": eval_active,
+        "eval_inactive": eval_inactive,
+        "pro_active": pro_active,
+        "pro_blown": pro_blown,
+        "resets_used_total": resets_used_total,
+    }
+
+# =========================================================
+# APP STARTUP
+# =========================================================
+# Use migrations init (works even if DB already exists). You asked to reset DB, but keep safe.
+init_db_with_migrations()
+
+st.title("Account Stats Game — Ledger + Manual Tournament Engine")
+
+# =========================================================
+# DB RESET PANEL (TOP)
+# =========================================================
+with st.expander("⚠️ Database reset", expanded=False):
+    st.write("This deletes the local SQLite file and recreates an empty database.")
+    confirm = st.checkbox("I understand this will delete all data in this app.", value=False)
+    if st.button("RESET DATABASE NOW", type="primary", disabled=not confirm):
+        try:
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
+            init_db_fresh()
+            st.success("Database reset complete.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Reset failed: {e}")
+
+# Load rules
 rules = get_rules()
 
-st.title("Account Simulator (Stats Game + Spend vs Withdrawals)")
-
+# =========================================================
+# RULES UI
+# =========================================================
 with st.expander("Global Rules", expanded=True):
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    account_cost = c1.number_input("Account cost", min_value=0.0, value=rules["account_cost_usd"], step=1.0)
-    reset_cost = c2.number_input("Reset cost", min_value=0.0, value=rules["reset_cost_usd"], step=1.0)
-    max_resets = c3.number_input("Max resets", min_value=0, value=rules["max_resets"], step=1)
-    win_amt = c4.number_input("Win/Loss amount", min_value=0.0, value=rules["win_amount_usd"], step=100.0)
-    pro_thr = c5.number_input("Pro threshold", min_value=0.0, value=rules["pro_threshold_usd"], step=500.0)
-    cushion = c6.number_input("Cushion", min_value=0.0, value=rules["cushion_usd"], step=100.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c5, c6, c7 = st.columns(3)
+
+    r = dict(rules)
+    r["account_cost_usd"] = c1.number_input("Account cost (USD)", min_value=0.0, value=r["account_cost_usd"], step=1.0)
+    r["reset_cost_usd"] = c2.number_input("Reset cost (USD)", min_value=0.0, value=r["reset_cost_usd"], step=1.0)
+    r["max_resets"] = c3.number_input("Max resets (Eval)", min_value=0, value=r["max_resets"], step=1)
+    r["max_pro_accounts"] = c4.number_input("Max Pro accounts (global)", min_value=0, value=r["max_pro_accounts"], step=1)
+
+    r["win_amount_usd"] = c5.number_input("Win/Loss amount (virtual)", min_value=0.0, value=r["win_amount_usd"], step=100.0)
+    r["pro_threshold_usd"] = c6.number_input("Pro threshold (virtual)", min_value=0.0, value=r["pro_threshold_usd"], step=500.0)
+    r["cushion_usd"] = c7.number_input("Cushion (virtual, Pro)", min_value=0.0, value=r["cushion_usd"], step=100.0)
 
     if st.button("Save rules"):
-        set_rules(account_cost, reset_cost, int(max_resets), win_amt, pro_thr, cushion)
-        st.success("Saved.")
+        set_rules(r)
+        st.success("Rules saved.")
         st.rerun()
 
-rules = get_rules()
+# =========================================================
+# DATA LOAD
+# =========================================================
+participants = list_participants()
+accounts = list_accounts_full()
+withdrawals = withdrawals_df()
+
+# =========================================================
+# GLOBAL SUMMARY
+# =========================================================
+s = global_summary(accounts, withdrawals)
+
+st.subheader("Global Summary (clear + real money)")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Accounts", s["accounts_total"])
+m2.metric("Spend (real)", f"{s['spend']:,.2f}")
+m3.metric("Withdrawn (real)", f"{s['withdrawn']:,.2f}")
+m4.metric("Net (real)", f"{s['net']:,.2f}")
+m5.metric("Pro active", f"{s['pro_active']}/{rules['max_pro_accounts']}")
+
+m6, m7, m8, m9, m10 = st.columns(5)
+m6.metric("Eval active", s["eval_active"])
+m7.metric("Eval inactive", s["eval_inactive"])
+m8.metric("Inactive total", s["inactive"])
+m9.metric("Blown", s["blown"])
+m10.metric("Resets used (total)", s["resets_used_total"])
+
 st.divider()
 
-l0, r0 = st.columns([1.1, 2.9], gap="large")
-with l0:
-    st.subheader("Add participant")
-    name = st.text_input("Name", placeholder="Rene / Friend1 / Friend2")
-    if st.button("Add", use_container_width=True):
-        add_participant(name)
+# =========================================================
+# PARTICIPANTS + LEDGER SECTION
+# =========================================================
+st.subheader("Ledger — Participants & Accounts")
+
+left, right = st.columns([1.15, 2.85], gap="large")
+with left:
+    st.markdown("### Add participant")
+    new_name = st.text_input("Name", placeholder="Rene / Friend1 / Friend2")
+    if st.button("Add participant", use_container_width=True):
+        add_participant(new_name)
         st.rerun()
 
-with r0:
-    st.subheader("Global summary")
-    acc = list_accounts_full()
-    wd = withdrawals_df()
-
-    if acc.empty:
-        st.info("No accounts yet.")
+with right:
+    if participants.empty:
+        st.info("Add participants to start.")
     else:
-        acc["spend_usd"] = acc["purchase_paid_usd"].astype(float) + acc["resets_paid_usd"].astype(float)
-        total_spend = float(acc["spend_usd"].sum())
-        total_withdrawn = float(wd["amount_usd"].sum()) if not wd.empty else 0.0
-        net = total_withdrawn - total_spend
-        roi = (net / total_spend) if total_spend > 0 else 0.0
+        # Per participant summaries
+        accounts["spend_usd"] = accounts["purchase_paid_usd"].astype(float) + accounts["resets_paid_usd"].astype(float)
+        wd_by = withdrawals.groupby("participant_id", as_index=False)["amount_usd"].sum().rename(columns={"amount_usd": "withdrawn_usd"}) if not withdrawals.empty else pd.DataFrame(columns=["participant_id", "withdrawn_usd"])
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Accounts", len(acc))
-        m2.metric("Total spend (real)", f"{total_spend:,.2f}")
-        m3.metric("Total withdrawn (real)", f"{total_withdrawn:,.2f}")
-        m4.metric("Net (real)", f"{net:,.2f}")
-        m5.metric("ROI", f"{roi*100:,.1f}%")
-
-        byp = acc.groupby("participant", as_index=False).agg(
+        byp = accounts.groupby(["participant_id", "participant"], as_index=False).agg(
             accounts=("id", "count"),
             active=("active", "sum"),
             blown=("blown", "sum"),
             spend_usd=("spend_usd", "sum"),
-            balance_virtual=("balance_usd", "sum"),
-            withdrawable_virtual=("withdrawable_usd", "sum"),
+            resets_used=("resets_used", "sum"),
         )
-        if not wd.empty:
-            wd_by = wd.groupby("participant", as_index=False)["amount_usd"].sum().rename(columns={"amount_usd": "withdrawn_usd"})
-            byp = byp.merge(wd_by, on="participant", how="left").fillna(0.0)
-        else:
-            byp["withdrawn_usd"] = 0.0
+        byp = byp.merge(wd_by, on="participant_id", how="left").fillna({"withdrawn_usd": 0.0})
         byp["net_usd"] = byp["withdrawn_usd"] - byp["spend_usd"]
         byp = byp.sort_values("net_usd", ascending=False)
-        st.dataframe(byp, use_container_width=True, hide_index=True)
 
-st.divider()
+        st.markdown("### Per-participant summary (real money)")
+        st.dataframe(byp[["participant", "accounts", "active", "blown", "resets_used", "spend_usd", "withdrawn_usd", "net_usd"]],
+                     use_container_width=True, hide_index=True)
 
-st.subheader("Match Center (auto-match, you click winner)")
-session = st.session_state.get("session_name")
-if not session:
-    session = gen_session_name()
-    st.session_state["session_name"] = session
+# Per participant detailed panels
+if not participants.empty:
+    for _, p in participants.iterrows():
+        pid = int(p["id"])
+        pname = str(p["name"])
 
-open_match = get_latest_open_match()
-if open_match is None:
-    a, b = pick_next_match(rules)
-    if a is None or b is None:
-        st.warning("Need at least 2 ACTIVE accounts from different participants (not blown).")
-    else:
-        create_match(session, int(a["id"]), int(b["id"]))
-        open_match = get_latest_open_match()
+        p_acc = accounts[accounts["participant_id"] == pid].copy()
+        p_wd = withdrawals[withdrawals["participant_id"] == pid].copy() if not withdrawals.empty else pd.DataFrame()
 
-if open_match is not None:
-    st.write(f"Session: **{open_match['session_name']}**")
-    a_id = int(open_match["a_account_id"])
-    b_id = int(open_match["b_account_id"])
+        p_spend = float((p_acc["purchase_paid_usd"].astype(float) + p_acc["resets_paid_usd"].astype(float)).sum()) if not p_acc.empty else 0.0
+        p_withdrawn = float(p_wd["amount_usd"].sum()) if not p_wd.empty else 0.0
+        p_net = p_withdrawn - p_spend
 
-    acc_now = list_accounts_full().set_index("id")
-    if a_id not in acc_now.index or b_id not in acc_now.index:
-        st.warning("Matched account missing. Refresh the page.")
-    else:
-        a_row = acc_now.loc[a_id]
-        b_row = acc_now.loc[b_id]
+        with st.expander(f"{pname} — Spend {p_spend:,.2f} | Withdrawn {p_withdrawn:,.2f} | Net {p_net:,.2f}", expanded=False):
+            cA, cB, cC, cD = st.columns([1.1, 1.6, 1.6, 1.7], gap="large")
 
-        cA, cB = st.columns(2, gap="large")
-
-        def card(col, row, acc_id: int, label: str):
-            with col:
-                st.markdown(f"### {row['participant']}")
-                st.markdown(f"**{row['code']}** (#{acc_id})")
-                st.write(f"Phase: **{row['phase']}**")
-                st.write(f"Status: **{'Active' if int(row['active'])==1 else 'Inactive'}**   |   Blown: **{'Yes' if int(row['blown'])==1 else 'No'}**")
-                st.write(f"Resets used: **{int(row['resets_used'])}/{rules['max_resets']}**")
-                st.write(f"Balance (virtual): **{float(row['balance_usd']):,.0f}**")
-                st.write(f"Withdrawable (virtual): **{float(row['withdrawable_usd']):,.0f}**")
-                return st.button(f"✅ {label} WINS", type="primary", use_container_width=True)
-
-        if card(cA, a_row, a_id, "A"):
-            resolve_match_apply(int(open_match["id"]), a_id, b_id, rules)
-            st.rerun()
-        if card(cB, b_row, b_id, "B"):
-            resolve_match_apply(int(open_match["id"]), b_id, a_id, rules)
-            st.rerun()
-
-st.divider()
-
-st.subheader("Participants (each has their own table)")
-p_df = list_participants()
-acc_df = list_accounts_full()
-wd_df = withdrawals_df()
-
-if p_df.empty:
-    st.info("Add participants above.")
-else:
-    for _, prow in p_df.iterrows():
-        pid = int(prow["id"])
-        pname = str(prow["name"])
-
-        user_acc = acc_df[acc_df["participant_id"] == pid].copy()
-        user_acc["status"] = user_acc["active"].map(lambda x: "Active" if int(x) == 1 else "Inactive")
-        user_acc["resets_remaining"] = rules["max_resets"] - user_acc["resets_used"]
-        user_acc["spend_usd"] = user_acc["purchase_paid_usd"].astype(float) + user_acc["resets_paid_usd"].astype(float)
-
-        user_wd = wd_df[wd_df["participant_id"] == pid].copy() if not wd_df.empty else pd.DataFrame()
-        total_spend_u = float(user_acc["spend_usd"].sum()) if not user_acc.empty else 0.0
-        total_withdrawn_u = float(user_wd["amount_usd"].sum()) if not user_wd.empty else 0.0
-        net_u = total_withdrawn_u - total_spend_u
-
-        with st.expander(f"{pname}", expanded=True):
-            u1, u2, u3, u4 = st.columns([1.2, 1.2, 2.2, 1.6], gap="large")
-
-            with u1:
-                st.markdown("#### Shop")
-                if st.button(f"Buy account ({rules['account_cost_usd']:.0f} USD)", key=f"buy_{pid}", use_container_width=True):
+            # Buy
+            with cA:
+                st.markdown("#### Buy")
+                if st.button(f"Buy account (${rules['account_cost_usd']:.0f})", key=f"buy_{pid}", use_container_width=True):
                     buy_account(pid, pname, rules)
                     st.rerun()
 
-            with u2:
-                st.markdown("#### Summary")
-                st.write(f"Accounts: **{len(user_acc)}**")
-                st.write(f"Spend (real): **{total_spend_u:,.2f}**")
-                st.write(f"Withdrawn (real): **{total_withdrawn_u:,.2f}**")
-                st.write(f"Net (real): **{net_u:,.2f}**")
-
-            with u3:
+            # Reset (manual, Eval only)
+            with cB:
                 st.markdown("#### Manual reset (Eval only)")
-                inactive_eval = user_acc[(user_acc["active"] == 0) & (user_acc["phase"] == "Eval") & (user_acc["blown"] == 0)].copy()
-                if inactive_eval.empty:
-                    st.info("No inactive Eval accounts to reset.")
+                reset_candidates = p_acc[(p_acc["phase"] == "Eval") & (p_acc["active"] == 0) & (p_acc["blown"] == 0)].copy()
+                if reset_candidates.empty:
+                    st.caption("No inactive Eval accounts.")
                 else:
-                    inactive_eval["label"] = inactive_eval.apply(
+                    reset_candidates["label"] = reset_candidates.apply(
                         lambda r: f"{r['code']} (#{int(r['id'])}) | resets {int(r['resets_used'])}/{rules['max_resets']} | bal {float(r['balance_usd']):,.0f}",
                         axis=1
                     )
-                    pick = st.selectbox("Select inactive Eval account", inactive_eval["label"].tolist(), key=f"pick_reset_{pid}")
-                    acc_id = int(pick.split("#")[1].split(")")[0])
-                    if st.button(f"Reset selected (+{rules['reset_cost_usd']:.0f} USD)", key=f"do_reset_{pid}", type="primary", use_container_width=True):
-                        msg = manual_reset_account(acc_id, rules)
-                        (st.success if msg.startswith("Reset applied") else st.warning)(msg)
+                    sel = st.selectbox("Pick account", reset_candidates["label"].tolist(), key=f"reset_pick_{pid}")
+                    acc_id = int(sel.split("#")[1].split(")")[0])
+                    if st.button(f"Reset (+${rules['reset_cost_usd']:.0f})", key=f"reset_btn_{pid}", use_container_width=True):
+                        msg = manual_reset_eval(acc_id, rules)
+                        (st.success if msg.startswith("Reset") else st.warning)(msg)
                         st.rerun()
 
-            with u4:
-                st.markdown("#### Payout record (Pro only)")
-                pro = user_acc[(user_acc["phase"] == "Pro") & (user_acc["blown"] == 0)].copy()
-                if pro.empty:
-                    st.info("No Pro accounts.")
+            # Promote to Pro (manual)
+            with cC:
+                st.markdown("#### Promote to Pro (manual)")
+                eligible = p_acc[(p_acc["phase"] == "Eval") & (p_acc["blown"] == 0) & (p_acc["balance_usd"] >= rules["pro_threshold_usd"])].copy()
+                if eligible.empty:
+                    st.caption(f"No eligible accounts (need balance >= {rules['pro_threshold_usd']:,.0f}).")
                 else:
-                    pro["label"] = pro.apply(
+                    eligible["label"] = eligible.apply(
+                        lambda r: f"{r['code']} (#{int(r['id'])}) | bal {float(r['balance_usd']):,.0f}",
+                        axis=1
+                    )
+                    selp = st.selectbox("Pick eligible", eligible["label"].tolist(), key=f"pro_pick_{pid}")
+                    acc_id = int(selp.split("#")[1].split(")")[0])
+                    if st.button("Promote to Pro", key=f"promote_{pid}", use_container_width=True):
+                        msg = promote_to_pro(acc_id, rules)
+                        (st.success if msg.startswith("Promoted") else st.warning)(msg)
+                        st.rerun()
+
+            # Record withdrawal (Pro only, manual)
+            with cD:
+                st.markdown("#### Record withdrawal (Pro only)")
+                pro_accounts = p_acc[(p_acc["phase"] == "Pro") & (p_acc["blown"] == 0)].copy()
+                if pro_accounts.empty:
+                    st.caption("No Pro accounts.")
+                else:
+                    pro_accounts["label"] = pro_accounts.apply(
                         lambda r: f"{r['code']} (#{int(r['id'])}) | wd {float(r['withdrawable_usd']):,.0f} | bal {float(r['balance_usd']):,.0f}",
                         axis=1
                     )
-                    pickp = st.selectbox("Select Pro account", pro["label"].tolist(), key=f"pick_pro_{pid}")
-                    pro_id = int(pickp.split("#")[1].split(")")[0])
-                    base = st.number_input("Base amount", min_value=0.0, value=float(rules["cushion_usd"]), step=100.0, key=f"base_{pid}")
-                    tier = st.selectbox("Percent", ["50%", "80%"], key=f"tier_{pid}")
-                    pct = 0.50 if tier == "50%" else 0.80
-                    note = st.text_input("Note (optional)", key=f"note_{pid}")
+                    selw = st.selectbox("Pick Pro", pro_accounts["label"].tolist(), key=f"wd_pick_{pid}")
+                    acc_id = int(selw.split("#")[1].split(")")[0])
 
-                    if st.button(f"Record withdrawal ({int(pct*100)}% of {base:,.0f})", key=f"wd_{pid}", use_container_width=True):
-                        msg = record_withdrawal(pid, pro_id, pct, base, note, rules)
-                        (st.success if msg.startswith("Recorded") else st.warning)(msg)
+                    tier = st.selectbox("Tier", ["50%", "80%", "Custom"], key=f"wd_tier_{pid}")
+                    if tier == "50%":
+                        pct = 0.50
+                    elif tier == "80%":
+                        pct = 0.80
+                    else:
+                        pct = st.number_input("Percent", min_value=0.0, max_value=1.0, value=0.50, step=0.05, key=f"wd_pct_{pid}")
+
+                    base = st.number_input("Base amount", min_value=0.0, value=float(rules["cushion_usd"]), step=100.0, key=f"wd_base_{pid}")
+                    note = st.text_input("Note", key=f"wd_note_{pid}")
+
+                    if st.button("Record withdrawal", key=f"wd_btn_{pid}", use_container_width=True):
+                        msg = record_withdrawal(pid, acc_id, pct, base, note, rules)
+                        (st.success if msg.startswith("Withdrawal") else st.warning)(msg)
                         st.rerun()
 
-                st.markdown("#### Cleanup")
-                exhausted_eval = user_acc[(user_acc["phase"] == "Eval") & (user_acc["resets_used"] >= rules["max_resets"])].copy()
-                blown_pro = user_acc[(user_acc["phase"] == "Pro") & (user_acc["blown"] == 1)].copy()
-                cleanup = pd.concat([exhausted_eval, blown_pro], ignore_index=True) if (not exhausted_eval.empty or not blown_pro.empty) else pd.DataFrame()
-
-                if not cleanup.empty:
-                    cleanup["label"] = cleanup.apply(
-                        lambda r: f"{r['code']} (#{int(r['id'])}) | {r['phase']} | {'BLOWN' if int(r['blown'])==1 else 'EXHAUSTED'}",
-                        axis=1
-                    )
-                    pickc = st.selectbox("Delete account", cleanup["label"].tolist(), key=f"pick_clean_{pid}")
-                    del_id = int(pickc.split("#")[1].split(")")[0])
-                    if st.button("Delete selected", key=f"del_{pid}", use_container_width=True):
-                        delete_account(del_id)
-                        st.rerun()
-                else:
-                    st.caption("Nothing to clean.")
-
-            st.markdown("#### Accounts table")
-            if user_acc.empty:
+            st.markdown("#### Accounts")
+            if p_acc.empty:
                 st.write("No accounts yet.")
             else:
-                view = user_acc[[
-                    "id", "code", "phase", "status", "blown",
-                    "resets_used", "resets_remaining",
-                    "balance_usd", "withdrawable_usd",
-                    "purchase_paid_usd", "resets_paid_usd", "spend_usd"
-                ]].copy()
-                st.dataframe(view, use_container_width=True, hide_index=True)
-
-            if not user_wd.empty:
-                st.markdown("#### Withdrawal history")
+                view = p_acc.copy()
+                view["spend_usd"] = view["purchase_paid_usd"].astype(float) + view["resets_paid_usd"].astype(float)
+                view["status"] = view.apply(
+                    lambda r: "BLOWN" if int(r["blown"]) == 1 else ("Active" if int(r["active"]) == 1 else "Inactive"),
+                    axis=1
+                )
                 st.dataframe(
-                    user_wd[["id", "account_id", "percent", "base_amount_usd", "amount_usd", "created_at", "note"]],
+                    view[[
+                        "id", "code", "phase", "status",
+                        "resets_used",
+                        "balance_usd", "withdrawable_usd",
+                        "purchase_paid_usd", "resets_paid_usd", "spend_usd"
+                    ]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            if not p_wd.empty:
+                st.markdown("#### Withdrawal history (real money records)")
+                st.dataframe(
+                    p_wd[["id", "account_id", "percent", "base_amount_usd", "amount_usd", "created_at", "note"]],
                     use_container_width=True,
                     hide_index=True
                 )
 
 st.divider()
-st.subheader("Recent matches")
-st.dataframe(recent_matches(25), use_container_width=True, hide_index=True)
+
+# =========================================================
+# TOURNAMENT ENGINE (SEPARATE SECTION)
+# =========================================================
+st.subheader("Tournament Engine — Manual Match Selection (you choose who fights)")
+
+accounts = list_accounts_full()  # reload (in case something changed)
+if accounts.empty:
+    st.info("Create accounts first.")
+else:
+    eligible = accounts[(accounts["active"] == 1) & (accounts["blown"] == 0)].copy()
+    eligible["label"] = eligible.apply(
+        lambda r: f"{r['participant']} | {r['code']} (#{int(r['id'])}) | {r['phase']} | bal {float(r['balance_usd']):,.0f}",
+        axis=1
+    )
+
+    col1, col2, col3 = st.columns([1.4, 1.4, 1.2], gap="large")
+
+    with col1:
+        a_pick = st.selectbox("Pick Account A", eligible["label"].tolist(), key="pick_A") if not eligible.empty else None
+    with col2:
+        b_pick = st.selectbox("Pick Account B", eligible["label"].tolist(), key="pick_B") if not eligible.empty else None
+    with col3:
+        note = st.text_input("Match note (optional)", key="match_note")
+
+    def parse_id(label: str) -> int:
+        return int(label.split("#")[1].split(")")[0])
+
+    # Optional rule: prevent same-participant matches (toggle)
+    prevent_same = st.checkbox("Prevent same participant fights", value=True)
+
+    if st.button("Create match", type="primary"):
+        if not a_pick or not b_pick:
+            st.warning("Pick both accounts.")
+        else:
+            a_id = parse_id(a_pick)
+            b_id = parse_id(b_pick)
+
+            if prevent_same:
+                pa = eligible[eligible["id"] == a_id]["participant_id"].iloc[0]
+                pb = eligible[eligible["id"] == b_id]["participant_id"].iloc[0]
+                if int(pa) == int(pb):
+                    st.warning("Same participant. Pick a different opponent or disable the checkbox.")
+                    st.stop()
+
+            msg = create_match(a_id, b_id, note)
+            (st.success if msg.startswith("Match created") else st.warning)(msg)
+            st.rerun()
+
+    open_m = get_open_match()
+    if open_m is None:
+        st.info("No open match. Create one above.")
+    else:
+        st.markdown("### Open match")
+        a_id = int(open_m["a_account_id"])
+        b_id = int(open_m["b_account_id"])
+
+        idx = accounts.set_index("id")
+        if a_id not in idx.index or b_id not in idx.index:
+            st.warning("Match accounts missing. (Reset DB or delete match row.)")
+        else:
+            a = idx.loc[a_id]
+            b = idx.loc[b_id]
+
+            cA, cB = st.columns(2, gap="large")
+            with cA:
+                st.markdown(f"**A:** {a['participant']} — {a['code']} (#{a_id})")
+                st.write(f"Phase: {a['phase']} | Balance: {float(a['balance_usd']):,.0f} | WD: {float(a['withdrawable_usd']):,.0f}")
+                if st.button("✅ A WINS", type="primary", use_container_width=True):
+                    msg = resolve_match(int(open_m["id"]), a_id, b_id, rules)
+                    st.success(msg)
+                    st.rerun()
+            with cB:
+                st.markdown(f"**B:** {b['participant']} — {b['code']} (#{b_id})")
+                st.write(f"Phase: {b['phase']} | Balance: {float(b['balance_usd']):,.0f} | WD: {float(b['withdrawable_usd']):,.0f}")
+                if st.button("✅ B WINS", type="primary", use_container_width=True):
+                    msg = resolve_match(int(open_m["id"]), b_id, a_id, rules)
+                    st.success(msg)
+                    st.rerun()
+
+st.divider()
+st.subheader("Match history")
+st.dataframe(matches_df(50), use_container_width=True, hide_index=True)
 
 st.caption(
-    "This app is a stats/game ledger: real spend (purchases/resets) and recorded withdrawals are tracked, "
-    "while balances/thresholds/cushion are simulated values to support tracking."
+    "This is a tracking/stats game ledger: real money is only purchases/resets/recorded withdrawals; "
+    "balances are simulated values used for your workflow tracking."
 )
