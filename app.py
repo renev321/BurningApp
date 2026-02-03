@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime
 import random
 import string
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Set
 
 import pandas as pd
 import streamlit as st
@@ -19,21 +19,28 @@ def db():
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-def table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+def get_table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
     rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-    return any(r[1] == col for r in rows)
+    return set(r[1] for r in rows)
 
 def safe_add_column(conn: sqlite3.Connection, table: str, coldef: str):
     # coldef like: "phase TEXT NOT NULL DEFAULT 'Eval'"
     colname = coldef.split()[0]
-    if not table_has_column(conn, table, colname):
+    cols = get_table_columns(conn, table)
+    if colname not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {coldef};")
 
+def ensure_rules_row(conn: sqlite3.Connection):
+    conn.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
+
+# =========================================================
+# INIT + MIGRATIONS
+# =========================================================
 def init_db():
     conn = db()
     cur = conn.cursor()
 
-    # ------------------ RULES (CREATE + MIGRATE) ------------------
+    # ------------------ RULES ------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS rules(
       id INTEGER PRIMARY KEY CHECK(id=1),
@@ -45,9 +52,9 @@ def init_db():
       cushion_usd       REAL    NOT NULL DEFAULT 4500
     );
     """)
-    cur.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
+    ensure_rules_row(conn)
 
-    # If rules existed from old versions, add missing columns safely
+    # Migrate rules for older DBs
     safe_add_column(conn, "rules", "account_cost_usd REAL NOT NULL DEFAULT 216")
     safe_add_column(conn, "rules", "reset_cost_usd REAL NOT NULL DEFAULT 100")
     safe_add_column(conn, "rules", "max_resets INTEGER NOT NULL DEFAULT 5")
@@ -65,6 +72,7 @@ def init_db():
     """)
 
     # ------------------ ACCOUNTS ------------------
+    # Create minimal (older DB might exist already)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS accounts(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,10 +88,18 @@ def init_db():
     );
     """)
 
-    # Account migrations
-    safe_add_column(conn, "accounts", "phase TEXT NOT NULL DEFAULT 'Eval'")            # Eval / Pro
-    safe_add_column(conn, "accounts", "blown INTEGER NOT NULL DEFAULT 0")             # Pro dead forever
-    safe_add_column(conn, "accounts", "withdrawable_usd REAL NOT NULL DEFAULT 0")     # virtual
+    # Migrate accounts for older DBs (these are SAFE to run always)
+    safe_add_column(conn, "accounts", "active INTEGER NOT NULL DEFAULT 1")
+    safe_add_column(conn, "accounts", "resets_used INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "accounts", "purchase_paid_usd REAL NOT NULL DEFAULT 0")
+    safe_add_column(conn, "accounts", "resets_paid_usd REAL NOT NULL DEFAULT 0")
+    safe_add_column(conn, "accounts", "balance_usd REAL NOT NULL DEFAULT 0")
+    safe_add_column(conn, "accounts", "created_at TEXT NOT NULL DEFAULT ''")
+
+    # New features
+    safe_add_column(conn, "accounts", "phase TEXT NOT NULL DEFAULT 'Eval'")
+    safe_add_column(conn, "accounts", "blown INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "accounts", "withdrawable_usd REAL NOT NULL DEFAULT 0")
 
     # ------------------ MATCHES ------------------
     cur.execute("""
@@ -123,19 +139,24 @@ def init_db():
 # =========================================================
 def get_rules():
     conn = db()
-    row = conn.execute("""
-      SELECT account_cost_usd, reset_cost_usd, max_resets, win_amount_usd, pro_threshold_usd, cushion_usd
+    ensure_rules_row(conn)
+
+    # If an old DB is missing columns, return safe defaults
+    cols = get_table_columns(conn, "rules")
+    def col_or_default(name: str, default_sql: str):
+        return name if name in cols else f"{default_sql} AS {name}"
+
+    q = f"""
+      SELECT
+        {col_or_default("account_cost_usd", "216")},
+        {col_or_default("reset_cost_usd", "100")},
+        {col_or_default("max_resets", "5")},
+        {col_or_default("win_amount_usd", "4500")},
+        {col_or_default("pro_threshold_usd", "9000")},
+        {col_or_default("cushion_usd", "4500")}
       FROM rules WHERE id=1
-    """).fetchone()
-
-    if row is None:
-        conn.execute("INSERT OR IGNORE INTO rules(id) VALUES(1);")
-        conn.commit()
-        row = conn.execute("""
-          SELECT account_cost_usd, reset_cost_usd, max_resets, win_amount_usd, pro_threshold_usd, cushion_usd
-          FROM rules WHERE id=1
-        """).fetchone()
-
+    """
+    row = conn.execute(q).fetchone()
     conn.close()
 
     return {
@@ -207,34 +228,59 @@ def next_account_code(pid: int, pname: str) -> str:
 def buy_account(pid: int, pname: str, rules: dict):
     code = next_account_code(pid, pname)
     conn = db()
-    conn.execute("""
-      INSERT INTO accounts(participant_id, code, active, resets_used, purchase_paid_usd, resets_paid_usd,
-                           balance_usd, phase, blown, withdrawable_usd, created_at)
-      VALUES(?, ?, 1, 0, ?, 0, 0, 'Eval', 0, 0, ?)
-    """, (int(pid), code, float(rules["account_cost_usd"]), datetime.utcnow().isoformat()))
+    cols = get_table_columns(conn, "accounts")
+
+    # Insert only columns that exist (super safe with old DBs)
+    fields = ["participant_id", "code"]
+    values = [int(pid), code]
+
+    def add_if(col, val):
+        if col in cols:
+            fields.append(col)
+            values.append(val)
+
+    add_if("active", 1)
+    add_if("resets_used", 0)
+    add_if("purchase_paid_usd", float(rules["account_cost_usd"]))
+    add_if("resets_paid_usd", 0.0)
+    add_if("balance_usd", 0.0)
+    add_if("phase", "Eval")
+    add_if("blown", 0)
+    add_if("withdrawable_usd", 0.0)
+    add_if("created_at", datetime.utcnow().isoformat())
+
+    q = f"INSERT INTO accounts({', '.join(fields)}) VALUES({', '.join(['?']*len(fields))})"
+    conn.execute(q, values)
     conn.commit()
     conn.close()
 
 def list_accounts_full():
     conn = db()
-    df = pd.read_sql_query("""
-      SELECT a.id,
-             p.name AS participant,
-             p.id   AS participant_id,
-             a.code,
-             a.active,
-             a.phase,
-             a.blown,
-             a.resets_used,
-             a.purchase_paid_usd,
-             a.resets_paid_usd,
-             a.balance_usd,
-             a.withdrawable_usd,
-             a.created_at
+    cols = get_table_columns(conn, "accounts")
+
+    def sel(col: str, default_sql: str):
+        return f"a.{col}" if col in cols else f"{default_sql} AS {col}"
+
+    q = f"""
+      SELECT
+        a.id,
+        p.name AS participant,
+        p.id   AS participant_id,
+        a.code,
+        {sel("active", "1")},
+        {sel("phase", "'Eval'")},
+        {sel("blown", "0")},
+        {sel("resets_used", "0")},
+        {sel("purchase_paid_usd", "0")},
+        {sel("resets_paid_usd", "0")},
+        {sel("balance_usd", "0")},
+        {sel("withdrawable_usd", "0")},
+        {sel("created_at", "''")}
       FROM accounts a
       JOIN participants p ON p.id=a.participant_id
-      ORDER BY p.name, a.created_at DESC
-    """, conn)
+      ORDER BY p.name, a.id DESC
+    """
+    df = pd.read_sql_query(q, conn)
     conn.close()
     return df
 
@@ -242,28 +288,6 @@ def delete_account(account_id: int):
     conn = db()
     conn.execute("DELETE FROM withdrawals WHERE account_id=?", (int(account_id),))
     conn.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
-    conn.commit()
-    conn.close()
-
-def recompute_withdrawable(account_id: int, rules: dict):
-    conn = db()
-    cur = conn.cursor()
-    row = cur.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (int(account_id),)).fetchone()
-    if not row:
-        conn.close()
-        return
-    phase = row[0]
-    bal = float(row[1])
-    blown = int(row[2])
-
-    if blown == 1:
-        wd = 0.0
-    elif phase == "Pro":
-        wd = max(0.0, bal - float(rules["cushion_usd"]))
-    else:
-        wd = 0.0
-
-    cur.execute("UPDATE accounts SET withdrawable_usd=? WHERE id=?", (wd, int(account_id)))
     conn.commit()
     conn.close()
 
@@ -283,6 +307,26 @@ def promote_if_needed(account_id: int, rules: dict):
         conn.commit()
     conn.close()
 
+def recompute_withdrawable(account_id: int, rules: dict):
+    conn = db()
+    cur = conn.cursor()
+    row = cur.execute("SELECT phase, balance_usd, blown FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+    if not row:
+        conn.close()
+        return
+    phase, bal, blown = row[0], float(row[1]), int(row[2])
+
+    if blown == 1:
+        wd = 0.0
+    elif phase == "Pro":
+        wd = max(0.0, bal - float(rules["cushion_usd"]))
+    else:
+        wd = 0.0
+
+    cur.execute("UPDATE accounts SET withdrawable_usd=? WHERE id=?", (wd, int(account_id)))
+    conn.commit()
+    conn.close()
+
 def manual_reset_account(account_id: int, rules: dict) -> str:
     conn = db()
     cur = conn.cursor()
@@ -295,10 +339,7 @@ def manual_reset_account(account_id: int, rules: dict) -> str:
         conn.close()
         return "Account not found."
 
-    phase = row[0]
-    blown = int(row[1])
-    active = int(row[2])
-    resets_used = int(row[3])
+    phase, blown, active, resets_used = row[0], int(row[1]), int(row[2]), int(row[3])
 
     if blown == 1:
         conn.close()
@@ -325,7 +366,6 @@ def manual_reset_account(account_id: int, rules: dict) -> str:
 
     conn.commit()
     conn.close()
-
     recompute_withdrawable(account_id, rules)
     return f"Reset applied. Resets used: {resets_used}/{rules['max_resets']}"
 
@@ -356,17 +396,11 @@ def record_withdrawal(participant_id: int, account_id: int, percent: float, base
 
     conn = db()
     cur = conn.cursor()
-    row = cur.execute("""
-      SELECT phase, blown, withdrawable_usd
-      FROM accounts
-      WHERE id=?
-    """, (int(account_id),)).fetchone()
+    row = cur.execute("SELECT phase, blown, withdrawable_usd FROM accounts WHERE id=?", (int(account_id),)).fetchone()
     if not row:
         conn.close()
         return "Account not found."
-    phase = row[0]
-    blown = int(row[1])
-    withdrawable = float(row[2])
+    phase, blown, withdrawable = row[0], int(row[1]), float(row[2])
 
     if blown == 1:
         conn.close()
@@ -381,26 +415,14 @@ def record_withdrawal(participant_id: int, account_id: int, percent: float, base
     cur.execute("""
       INSERT INTO withdrawals(participant_id, account_id, percent, base_amount_usd, amount_usd, created_at, note)
       VALUES(?, ?, ?, ?, ?, ?, ?)
-    """, (
-        int(participant_id),
-        int(account_id),
-        float(percent),
-        float(base_amount),
-        float(amount),
-        datetime.utcnow().isoformat(),
-        (note or "").strip()
-    ))
+    """, (int(participant_id), int(account_id), float(percent), float(base_amount),
+          float(amount), datetime.utcnow().isoformat(), (note or "").strip()))
 
-    # Reduce virtual balance to reflect payout (sim)
-    cur.execute("""
-      UPDATE accounts
-      SET balance_usd = balance_usd - ?
-      WHERE id=?
-    """, (float(amount), int(account_id)))
+    # Reduce virtual balance to reflect payout
+    cur.execute("UPDATE accounts SET balance_usd = balance_usd - ? WHERE id=?", (float(amount), int(account_id)))
 
     conn.commit()
     conn.close()
-
     recompute_withdrawable(account_id, rules)
     return f"Recorded withdrawal: {amount:,.2f} USD"
 
@@ -422,9 +444,7 @@ def get_latest_open_match():
       LIMIT 1
     """, conn)
     conn.close()
-    if df.empty:
-        return None
-    return df.iloc[0]
+    return None if df.empty else df.iloc[0]
 
 def create_match(session_name: str, a_id: int, b_id: int):
     conn = db()
@@ -439,7 +459,6 @@ def pick_next_match(rules: dict) -> Tuple[Optional[pd.Series], Optional[pd.Serie
     df = list_accounts_full()
     if df.empty:
         return None, None
-
     df = df[(df["active"] == 1) & (df["blown"] == 0)]
     if len(df) < 2:
         return None, None
@@ -475,10 +494,10 @@ def resolve_match_apply(match_id: int, winner_id: int, loser_id: int, rules: dic
         conn.close()
         return
     loser_phase = loser_row[0]
-    loser_balance_before = float(loser_row[1])
-    loser_balance_after = loser_balance_before - win_amt
+    loser_balance_after = float(loser_row[1]) - win_amt
 
     if loser_phase == "Eval":
+        # Eval: inactive until manual reset
         cur.execute("""
           UPDATE accounts
           SET balance_usd = balance_usd - ?,
@@ -486,7 +505,7 @@ def resolve_match_apply(match_id: int, winner_id: int, loser_id: int, rules: dic
           WHERE id=?
         """, (win_amt, int(loser_id)))
     else:
-        # Pro: blown if goes below 0
+        # Pro: blown if balance goes below 0
         if loser_balance_after < 0:
             cur.execute("""
               UPDATE accounts
@@ -513,7 +532,6 @@ def resolve_match_apply(match_id: int, winner_id: int, loser_id: int, rules: dic
     conn.commit()
     conn.close()
 
-    # Promote + recompute
     promote_if_needed(winner_id, rules)
     promote_if_needed(loser_id, rules)
     recompute_withdrawable(winner_id, rules)
@@ -534,7 +552,7 @@ def recent_matches(limit=25):
 # =========================================================
 # UI
 # =========================================================
-init_db()  # must be BEFORE get_rules
+init_db()
 rules = get_rules()
 
 st.title("Account Simulator (Stats Game + Spend vs Withdrawals)")
@@ -572,7 +590,7 @@ with r0:
     if acc.empty:
         st.info("No accounts yet.")
     else:
-        acc["spend_usd"] = acc["purchase_paid_usd"] + acc["resets_paid_usd"]
+        acc["spend_usd"] = acc["purchase_paid_usd"].astype(float) + acc["resets_paid_usd"].astype(float)
         total_spend = float(acc["spend_usd"].sum())
         total_withdrawn = float(wd["amount_usd"].sum()) if not wd.empty else 0.0
         net = total_withdrawn - total_spend
@@ -600,7 +618,6 @@ with r0:
             byp["withdrawn_usd"] = 0.0
         byp["net_usd"] = byp["withdrawn_usd"] - byp["spend_usd"]
         byp = byp.sort_values("net_usd", ascending=False)
-
         st.dataframe(byp, use_container_width=True, hide_index=True)
 
 st.divider()
@@ -669,7 +686,7 @@ else:
         user_acc = acc_df[acc_df["participant_id"] == pid].copy()
         user_acc["status"] = user_acc["active"].map(lambda x: "Active" if int(x) == 1 else "Inactive")
         user_acc["resets_remaining"] = rules["max_resets"] - user_acc["resets_used"]
-        user_acc["spend_usd"] = user_acc["purchase_paid_usd"] + user_acc["resets_paid_usd"]
+        user_acc["spend_usd"] = user_acc["purchase_paid_usd"].astype(float) + user_acc["resets_paid_usd"].astype(float)
 
         user_wd = wd_df[wd_df["participant_id"] == pid].copy() if not wd_df.empty else pd.DataFrame()
         total_spend_u = float(user_acc["spend_usd"].sum()) if not user_acc.empty else 0.0
@@ -736,9 +753,7 @@ else:
                 blown_pro = user_acc[(user_acc["phase"] == "Pro") & (user_acc["blown"] == 1)].copy()
                 cleanup = pd.concat([exhausted_eval, blown_pro], ignore_index=True) if (not exhausted_eval.empty or not blown_pro.empty) else pd.DataFrame()
 
-                if cleanup.empty:
-                    st.caption("Nothing to clean.")
-                else:
+                if not cleanup.empty:
                     cleanup["label"] = cleanup.apply(
                         lambda r: f"{r['code']} (#{int(r['id'])}) | {r['phase']} | {'BLOWN' if int(r['blown'])==1 else 'EXHAUSTED'}",
                         axis=1
@@ -748,6 +763,8 @@ else:
                     if st.button("Delete selected", key=f"del_{pid}", use_container_width=True):
                         delete_account(del_id)
                         st.rerun()
+                else:
+                    st.caption("Nothing to clean.")
 
             st.markdown("#### Accounts table")
             if user_acc.empty:
