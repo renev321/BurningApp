@@ -76,8 +76,8 @@ def init_db_fresh():
       purchase_paid_usd REAL NOT NULL DEFAULT 0,
       resets_paid_usd REAL NOT NULL DEFAULT 0,
 
-      balance_usd REAL NOT NULL DEFAULT 0,       -- virtual
-      withdrawable_usd REAL NOT NULL DEFAULT 0,  -- virtual
+      balance_usd REAL NOT NULL DEFAULT 0,       -- simulated
+      withdrawable_usd REAL NOT NULL DEFAULT 0,  -- simulated
 
       created_at TEXT NOT NULL,
 
@@ -98,7 +98,7 @@ def init_db_fresh():
       created_at TEXT NOT NULL,
       note TEXT NOT NULL DEFAULT '',
 
-      action TEXT NOT NULL DEFAULT 'none',  -- 'blow' or 'reset_to_pro0' (game mechanic)
+      action TEXT NOT NULL DEFAULT 'blow',  -- always blow in this ruleset
 
       FOREIGN KEY(participant_id) REFERENCES participants(id),
       FOREIGN KEY(account_id) REFERENCES accounts(id)
@@ -158,7 +158,7 @@ def init_db_with_migrations():
     );
     """)
 
-    # accounts
+    # accounts base
     cur.execute("""
     CREATE TABLE IF NOT EXISTS accounts(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +193,7 @@ def init_db_with_migrations():
       FOREIGN KEY(account_id) REFERENCES accounts(id)
     );
     """)
-    safe_add_column(conn, "withdrawals", "action TEXT NOT NULL DEFAULT 'none'")
+    safe_add_column(conn, "withdrawals", "action TEXT NOT NULL DEFAULT 'blow'")
 
     # matches
     cur.execute("""
@@ -213,7 +213,7 @@ def init_db_with_migrations():
     safe_add_column(conn, "matches", "winner_stage_after   TEXT NULL")
     safe_add_column(conn, "matches", "loser_stage_after    TEXT NULL")
 
-    # migrate old names if any
+    # rename legacy
     try:
         conn.execute("UPDATE accounts SET stage='Pro-Pending' WHERE stage='Qualified';")
     except Exception:
@@ -343,15 +343,15 @@ def eval_lives_left(resets_used: int, rules: Dict[str, Any]) -> int:
 
 def recompute_account_state(account_id: int, rules: Dict[str, Any]):
     """
-    SINGLE SOURCE OF TRUTH:
-    - auto-pro promotion (Eval active, bal >= threshold, pro slot available)
+    Single source of truth:
+    - auto promote Eval -> Pro (if threshold reached and slot available)
     - withdrawable calc
     - stage calc (non-sticky)
     """
     conn = db()
     cur = conn.cursor()
     row = cur.execute("""
-        SELECT phase, blown, active, balance_usd, resets_used
+        SELECT phase, blown, active, balance_usd
         FROM accounts
         WHERE id=?
     """, (account_id,)).fetchone()
@@ -359,12 +359,11 @@ def recompute_account_state(account_id: int, rules: Dict[str, Any]):
         conn.close()
         return
 
-    phase, blown, active, bal, resets_used = row[0], int(row[1]), int(row[2]), float(row[3]), int(row[4])
+    phase, blown, active, bal = row[0], int(row[1]), int(row[2]), float(row[3])
 
-    # 1) Auto promote: only if Eval + active + not blown
+    # Auto promote Eval -> Pro (consumes eval profit => Pro balance 0)
     if blown == 0 and phase == "Eval" and active == 1 and bal >= float(rules["pro_threshold_usd"]):
         if not pro_slots_full(rules):
-            # promote to Pro and reset balance to 0 (Eval profit is consumed)
             phase = "Pro"
             bal = 0.0
             cur.execute("""
@@ -372,15 +371,15 @@ def recompute_account_state(account_id: int, rules: Dict[str, Any]):
                 SET phase='Pro', balance_usd=0, withdrawable_usd=0
                 WHERE id=?
             """, (account_id,))
-        # else: remain Eval; stage will show Pro-Pending
+        # else stays Eval and becomes Pro-Pending via stage calc
 
-    # 2) Withdrawable
+    # Withdrawable only for Pro (simulated)
     wd = 0.0
     if blown == 0 and phase == "Pro":
         wd = max(0.0, bal - float(rules["cushion_usd"]))
     cur.execute("UPDATE accounts SET withdrawable_usd=? WHERE id=?", (wd, account_id))
 
-    # 3) Stage (simple & non-sticky)
+    # Stage
     if blown == 1:
         stage = "BLOWN"
     elif phase == "Eval":
@@ -392,7 +391,7 @@ def recompute_account_state(account_id: int, rules: Dict[str, Any]):
             else:
                 stage = "Eval"
     else:
-        # Pro buckets
+        # Pro buckets (still useful for UI tier display)
         if bal < float(rules["cushion_usd"]):
             stage = "Pro-0"
         elif bal < 2 * float(rules["cushion_usd"]):
@@ -474,7 +473,7 @@ def delete_account(account_id: int):
     conn.close()
 
 # =========================================================
-# WITHDRAWALS (NEW GAME RULE)
+# WITHDRAWALS (ALWAYS BLOW)
 # =========================================================
 def withdrawals_df():
     conn = db()
@@ -497,18 +496,12 @@ def withdrawals_df():
     return df
 
 def pro_withdraw_tier(balance_usd: float, rules: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Returns tier dict or None:
-      - if balance < cushion -> None
-      - cushion <= balance < 2*cushion -> 50% and action=blow
-      - balance >= 2*cushion -> 80% and action=reset_to_pro0
-    """
     cushion = float(rules["cushion_usd"])
     if balance_usd < cushion:
         return None
     if balance_usd < 2 * cushion:
         return {"pct": 0.50, "name": "50% (Pro-4.5k)", "action": "blow"}
-    return {"pct": 0.80, "name": "80% (Pro-9k+)", "action": "reset_to_pro0"}
+    return {"pct": 0.80, "name": "80% (Pro-9k+)", "action": "blow"}
 
 def record_withdrawal(participant_id: int, account_id: int, note: str, rules: Dict[str, Any]) -> str:
     conn = db()
@@ -538,39 +531,24 @@ def record_withdrawal(participant_id: int, account_id: int, note: str, rules: Di
     base = float(rules["cushion_usd"])
     pct = float(tier["pct"])
     amount = pct * base
-    action = tier["action"]
 
-    # Save withdrawal record (real-money tracking)
     cur.execute("""
       INSERT INTO withdrawals(participant_id, account_id, percent, base_amount_usd, amount_usd, created_at, note, action)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-    """, (participant_id, account_id, pct, base, amount, now_iso(), (note or "").strip(), action))
+      VALUES(?, ?, ?, ?, ?, ?, ?, 'blow')
+    """, (participant_id, account_id, pct, base, amount, now_iso(), (note or "").strip()))
 
-    # Apply game mechanic:
-    if action == "blow":
-        # 50% cash-out sacrifices the account
-        cur.execute("""
-          UPDATE accounts
-          SET active=0,
-              blown=1
-          WHERE id=?
-        """, (account_id,))
-        # keep balance as-is (or you can set it to 0); stage will show BLOWN
-    else:
-        # 80% cash-out resets Pro to 0 balance (account continues)
-        cur.execute("""
-          UPDATE accounts
-          SET balance_usd=0,
-              active=1,
-              blown=0
-          WHERE id=?
-        """, (account_id,))
+    # Always blow after withdrawal (your rule)
+    cur.execute("""
+      UPDATE accounts
+      SET active=0, blown=1
+      WHERE id=?
+    """, (account_id,))
 
     conn.commit()
     conn.close()
 
     recompute_account_state(account_id, rules)
-    return f"Withdrawal recorded: {amount:,.2f} USD | {tier['name']} | action={action}"
+    return f"Withdrawal recorded: {amount:,.2f} USD | {tier['name']} | action=BLOW"
 
 # =========================================================
 # MATCH ENGINE + TIMELINE SNAPSHOTS
@@ -615,19 +593,18 @@ def resolve_match(match_id: int, winner_id: int, loser_id: int, rules: Dict[str,
     conn = db()
     cur = conn.cursor()
 
-    # Winner +win_amt
+    # Winner always receives +win_amt
     cur.execute("UPDATE accounts SET balance_usd = balance_usd + ? WHERE id=?", (win_amt, winner_id))
 
-    # Loser -win_amt
-    loser = cur.execute("SELECT phase, balance_usd FROM accounts WHERE id=?", (loser_id,)).fetchone()
+    # Loser logic
+    loser = cur.execute("SELECT phase FROM accounts WHERE id=?", (loser_id,)).fetchone()
     if not loser:
         conn.close()
         return "Loser account not found."
     loser_phase = loser[0]
-    loser_balance_after = float(loser[1]) - win_amt
 
     if loser_phase == "Eval":
-        # Eval loses -> inactive
+        # Eval loses -> inactive (needs reset)
         cur.execute("""
           UPDATE accounts
           SET balance_usd = balance_usd - ?,
@@ -635,17 +612,14 @@ def resolve_match(match_id: int, winner_id: int, loser_id: int, rules: Dict[str,
           WHERE id=?
         """, (win_amt, loser_id))
     else:
-        # Pro loses -> blown only if balance would go < 0
-        if loser_balance_after < 0:
-            cur.execute("""
-              UPDATE accounts
-              SET balance_usd = balance_usd - ?,
-                  active = 0,
-                  blown = 1
-              WHERE id=?
-            """, (win_amt, loser_id))
-        else:
-            cur.execute("UPDATE accounts SET balance_usd = balance_usd - ? WHERE id=?", (win_amt, loser_id))
+        # Pro loses -> ALWAYS BLOWN (your rule)
+        cur.execute("""
+          UPDATE accounts
+          SET balance_usd = balance_usd - ?,
+              active = 0,
+              blown = 1
+          WHERE id=?
+        """, (win_amt, loser_id))
 
     # Close match
     cur.execute("""
@@ -663,7 +637,7 @@ def resolve_match(match_id: int, winner_id: int, loser_id: int, rules: Dict[str,
     recompute_account_state(winner_id, rules)
     recompute_account_state(loser_id, rules)
 
-    # Store after snapshots for timeline clarity
+    # Store snapshots
     conn = db()
     cur = conn.cursor()
     w = cur.execute("SELECT balance_usd, stage FROM accounts WHERE id=?", (winner_id,)).fetchone()
@@ -694,10 +668,10 @@ STATUS_META = {
     "Eval":          {"icon": "🟩", "label": "Eval (active)"},
     "Eval-Inactive": {"icon": "⬜", "label": "Eval inactive (needs reset)"},
     "Pro-Pending":   {"icon": "🟧", "label": "Hit 9k but waiting Pro slot"},
-    "Pro-0":         {"icon": "🟨", "label": "Pro balance < 4.5k"},
-    "Pro-4.5k":      {"icon": "🟦", "label": "Pro 4.5k–9k (withdraw 50% => blow)"},
-    "Pro-9k+":       {"icon": "🟪", "label": "Pro 9k+ (withdraw 80% => reset Pro-0)"},
-    "BLOWN":         {"icon": "🟥", "label": "BLOWN (dead)"},
+    "Pro-0":         {"icon": "🟨", "label": "Pro < 4.5k"},
+    "Pro-4.5k":      {"icon": "🟦", "label": "Pro 4.5k–9k"},
+    "Pro-9k+":       {"icon": "🟪", "label": "Pro 9k+"},
+    "BLOWN":         {"icon": "🟥", "label": "BLOWN"},
 }
 
 def status_counts(df: pd.DataFrame) -> Dict[str, int]:
@@ -720,30 +694,25 @@ def global_summary(acc: pd.DataFrame, wd: pd.DataFrame):
 # =========================================================
 def loss_impact(row, rules: Dict[str, Any]) -> Dict[str, Any]:
     phase = str(row["phase"])
-    bal = float(row["balance_usd"])
     resets_used = int(row["resets_used"])
-    win_amt = float(rules["win_amount_usd"])
 
     if phase == "Eval":
         lives = eval_lives_left(resets_used, rules)
         can_reset = resets_used < int(rules["max_resets"])
         return {
             "loser_state": "Eval-Inactive",
-            "reset_needed": bool(can_reset),
             "reset_cost": float(rules["reset_cost_usd"]) if can_reset else 0.0,
             "dead_if_loses": bool(not can_reset),
             "blow_risk": 0.0,
             "lives_left": lives,
         }
 
-    after = bal - win_amt
-    blown = after < 0
+    # Pro loses always blown
     return {
-        "loser_state": "BLOWN" if blown else "Pro",
-        "reset_needed": False,
+        "loser_state": "BLOWN",
         "reset_cost": 0.0,
-        "dead_if_loses": bool(blown),
-        "blow_risk": 1.0 if blown else 0.0,
+        "dead_if_loses": True,
+        "blow_risk": 1.0,
         "lives_left": None,
     }
 
@@ -806,16 +775,14 @@ def build_match_insights(all_accounts: pd.DataFrame, eligible: pd.DataFrame, rul
 def score_matchups(dfm: pd.DataFrame, objective: str) -> pd.DataFrame:
     if dfm.empty:
         return dfm
-    # Higher score = "better" for chosen objective (learning/sim)
     if objective == "Minimize reset cost exposure":
-        dfm["score"] = -(dfm["reset_cost_exposure"]) - 60 * dfm["blow_risk_exposure"] - 8 * dfm["pro_pending_signals"] + 6 * dfm["pro_progress_signals"]
+        dfm["score"] = -(dfm["reset_cost_exposure"]) - 80 * dfm["blow_risk_exposure"] - 10 * dfm["pro_pending_signals"] + 6 * dfm["pro_progress_signals"]
     elif objective == "Minimize blow risk":
-        dfm["score"] = -120 * dfm["blow_risk_exposure"] - 0.6 * dfm["reset_cost_exposure"] - 6 * dfm["pro_pending_signals"] + 6 * dfm["pro_progress_signals"]
+        dfm["score"] = -120 * dfm["blow_risk_exposure"] - 0.6 * dfm["reset_cost_exposure"] - 10 * dfm["pro_pending_signals"] + 6 * dfm["pro_progress_signals"]
     elif objective == "Maximize progress to Pro":
-        dfm["score"] = 25 * dfm["pro_progress_signals"] - 1.2 * dfm["reset_cost_exposure"] - 60 * dfm["blow_risk_exposure"] - 8 * dfm["pro_pending_signals"]
-    else:  # Balanced
-        dfm["score"] = 12 * dfm["pro_progress_signals"] - 1.0 * dfm["reset_cost_exposure"] - 80 * dfm["blow_risk_exposure"] - 8 * dfm["pro_pending_signals"]
-
+        dfm["score"] = 25 * dfm["pro_progress_signals"] - 1.2 * dfm["reset_cost_exposure"] - 80 * dfm["blow_risk_exposure"] - 10 * dfm["pro_pending_signals"]
+    else:
+        dfm["score"] = 12 * dfm["pro_progress_signals"] - 1.0 * dfm["reset_cost_exposure"] - 100 * dfm["blow_risk_exposure"] - 10 * dfm["pro_pending_signals"]
     return dfm.sort_values("score", ascending=False)
 
 # =========================================================
@@ -852,8 +819,9 @@ with st.expander("Global Rules", expanded=True):
     r["pro_threshold_usd"] = c6.number_input("Eval threshold to become Pro", min_value=0.0, value=r["pro_threshold_usd"], step=500.0)
     r["cushion_usd"] = c7.number_input("Cushion (Pro)", min_value=0.0, value=r["cushion_usd"], step=100.0)
 
-    st.caption("Auto rule: Eval reaches threshold => becomes Pro if Pro slot exists; otherwise becomes Pro-Pending.")
-    st.caption("Withdrawal rule: Pro-4.5k => withdraw 50% then blow; Pro-9k+ => withdraw 80% then reset to Pro-0.")
+    st.caption("Rules: Eval hits threshold => becomes Pro if slot exists, else Pro-Pending.")
+    st.caption("Rules: Withdraw from Pro => ALWAYS BLOWN (50% if Pro-4.5k, 80% if Pro-9k+).")
+    st.caption("Rules: Pro that loses a match => ALWAYS BLOWN.")
     if st.button("Save rules"):
         set_rules(r)
         st.success("Rules saved.")
@@ -864,7 +832,7 @@ accounts = list_accounts_full()
 withdrawals = withdrawals_df()
 matches = matches_df(200)
 
-# Compact STATUS MAP (one row)
+# Compact status row (no legend)
 counts = status_counts(accounts)
 st.subheader("Status Map (compact)")
 cols = st.columns(7)
@@ -872,11 +840,6 @@ keys = list(STATUS_META.keys())
 for col, k in zip(cols, keys):
     meta = STATUS_META[k]
     col.metric(f"{meta['icon']} {k}", counts[k])
-
-with st.expander("Legend (what each status means)", expanded=False):
-    for k in keys:
-        meta = STATUS_META[k]
-        st.write(f"{meta['icon']} **{k}** — {meta['label']}")
 
 # GLOBAL SUMMARY
 s = global_summary(accounts, withdrawals)
@@ -892,8 +855,8 @@ st.divider()
 
 # LEDGER
 st.subheader("Ledger — Participants")
-
 left, right = st.columns([1.1, 2.9], gap="large")
+
 with left:
     st.markdown("### Add participant")
     new_name = st.text_input("Name", placeholder="Rene / Friend1 / Friend2")
@@ -957,7 +920,7 @@ if not participants.empty:
 
         expanded = (st.session_state.open_pid == pid)
         with st.expander(f"{pname} — Spend {p_spend:,.2f} | Withdrawn {p_withdrawn:,.2f} | Net {p_net:,.2f}", expanded=expanded):
-            topL, topR = st.columns([3, 1])
+            _, topR = st.columns([3, 1])
             with topR:
                 if st.button("🗑️ Delete participant", key=f"del_{pid}"):
                     st.session_state.open_pid = None
@@ -973,10 +936,15 @@ if not participants.empty:
                     buy_account(pid, pname, rules)
                     st.rerun()
 
-                st.markdown("#### Manual reset (Eval only)")
-                reset_candidates = p_acc[(p_acc["stage"] == "Eval-Inactive") & (p_acc["phase"] == "Eval") & (p_acc["blown"] == 0)].copy()
+                st.markdown("#### Manual reset (Eval-Inactive only)")
+                reset_candidates = p_acc[
+                    (p_acc["phase"] == "Eval") &
+                    (p_acc["stage"] == "Eval-Inactive") &
+                    (p_acc["blown"] == 0)
+                ].copy()
+
                 if reset_candidates.empty:
-                    st.caption("No inactive Eval accounts.")
+                    st.caption("No Eval-Inactive accounts to reset.")
                 else:
                     reset_candidates["lives_left"] = reset_candidates["resets_used"].astype(int).apply(lambda x: eval_lives_left(x, rules))
                     reset_candidates["label"] = reset_candidates.apply(
@@ -997,6 +965,7 @@ if not participants.empty:
                     (p_acc["stage"] == "Eval-Inactive") &
                     (p_acc["resets_used"].astype(int) >= int(rules["max_resets"]))
                 ].copy()
+
                 if dead.empty:
                     st.caption("No dead Eval accounts.")
                 else:
@@ -1014,7 +983,6 @@ if not participants.empty:
                     if pro_acc.empty:
                         st.caption("No Pro accounts available.")
                     else:
-                        # Hide Pro-0 here by only showing >= cushion
                         pro_acc = pro_acc[pro_acc["balance_usd"].astype(float) >= float(rules["cushion_usd"])].copy()
                         if pro_acc.empty:
                             st.caption("No Pro accounts >= cushion (4.5k). Pro-0 is hidden here.")
@@ -1032,12 +1000,7 @@ if not participants.empty:
                             tier = pro_withdraw_tier(bal, rules)
 
                             st.info(f"Auto tier: **{tier['name']}**")
-                            st.write(f"Base amount fixed: **{float(rules['cushion_usd']):,.2f}**")
-                            if tier["action"] == "blow":
-                                st.warning("Action: **Withdraw -> Account becomes BLOWN** (sacrifice cash-out).")
-                            else:
-                                st.success("Action: **Withdraw -> Account resets to Pro-0** (continues).")
-
+                            st.warning("Action: **Withdrawal => Account becomes BLOWN** (always).")
                             note = st.text_input("Note", key=f"wd_note_{pid}")
                             if st.button("Record withdrawal", key=f"wd_btn_{pid}", use_container_width=True):
                                 st.session_state.open_pid = pid
@@ -1081,26 +1044,25 @@ if eligible.empty:
     st.info("No eligible active accounts.")
 else:
     prevent_same = st.checkbox("Prevent same participant fights", value=True)
-    allowed_types = ["Eval", "Pro-Pending", "Pro-0", "Pro-4.5k", "Pro-9k+"]
+
+    # IMPORTANT: remove Pro-Pending from tournament
+    allowed_types = ["Eval", "Pro-0", "Pro-4.5k", "Pro-9k+"]
     types_sel = st.multiselect("Allowed types", allowed_types, default=allowed_types)
     eligible = eligible[eligible["stage"].isin(types_sel)].copy()
 
-    # Match Insights (neutral ranking)
-    st.markdown("### Match Insights (simulator ranking)")
-    objective = st.selectbox(
-        "Objective",
-        ["Balanced", "Minimize reset cost exposure", "Minimize blow risk", "Maximize progress to Pro"],
-        index=0
-    )
-
-    dfm = build_match_insights(accounts, eligible, rules, prevent_same)
-    dfm = score_matchups(dfm, objective)
-
-    if dfm.empty:
-        st.caption("No candidate matchups for current filters.")
-    else:
-        st.dataframe(dfm.head(15), use_container_width=True, hide_index=True)
-        st.caption("This is simulator ranking based on chosen objective; it doesn't guarantee outcomes.")
+    with st.expander("Match Insights (simulator ranking)", expanded=False):
+        objective = st.selectbox(
+            "Objective",
+            ["Balanced", "Minimize reset cost exposure", "Minimize blow risk", "Maximize progress to Pro"],
+            index=0
+        )
+        dfm = build_match_insights(accounts, eligible, rules, prevent_same)
+        dfm = score_matchups(dfm, objective)
+        if dfm.empty:
+            st.caption("No candidate matchups for current filters.")
+        else:
+            st.dataframe(dfm.head(15), use_container_width=True, hide_index=True)
+            st.caption("Ranking is based on your chosen objective; it does not guarantee outcomes.")
 
     st.divider()
 
@@ -1134,14 +1096,15 @@ else:
         with c5:
             note = st.text_input("Match note (optional)", key="match_note")
 
-        # Coach: neutral impact
         st.markdown("#### Coach (impact preview)")
         idx = accounts.set_index("id")
         a = idx.loc[a_id]
         b = idx.loc[b_id]
+        a_loss = loss_impact(a, rules)
+        b_loss = loss_impact(b, rules)
         st.info(
-            f"If **A loses**: {loss_impact(a, rules)['loser_state']} | reset_cost={loss_impact(a, rules)['reset_cost']:.0f} | blow_risk={loss_impact(a, rules)['blow_risk']}\n\n"
-            f"If **B loses**: {loss_impact(b, rules)['loser_state']} | reset_cost={loss_impact(b, rules)['reset_cost']:.0f} | blow_risk={loss_impact(b, rules)['blow_risk']}"
+            f"If **A loses**: {a_loss['loser_state']} | reset_cost={a_loss['reset_cost']:.0f} | blow_risk={a_loss['blow_risk']}\n\n"
+            f"If **B loses**: {b_loss['loser_state']} | reset_cost={b_loss['reset_cost']:.0f} | blow_risk={b_loss['blow_risk']}"
         )
 
         if st.button("Create match", type="primary"):
@@ -1156,9 +1119,9 @@ else:
         if open_m is None:
             st.info("No open match.")
         else:
-            idx = list_accounts_full().set_index("id")
-            a = idx.loc[int(open_m["a_account_id"])]
-            b = idx.loc[int(open_m["b_account_id"])]
+            idx2 = list_accounts_full().set_index("id")
+            a = idx2.loc[int(open_m["a_account_id"])]
+            b = idx2.loc[int(open_m["b_account_id"])]
 
             st.markdown("### Open match")
             ca, cb = st.columns(2, gap="large")
@@ -1180,7 +1143,7 @@ else:
 st.divider()
 
 # =========================================================
-# TIMELINE
+# TIMELINE (no duplicate A/B row)
 # =========================================================
 st.subheader("Match Timeline — Chronological")
 
@@ -1207,17 +1170,13 @@ else:
 
     for _, row in m_chrono.iterrows():
         mid = int(row["id"])
-        a_id = int(row["a_account_id"])
-        b_id = int(row["b_account_id"])
         w_id = int(row["winner_account_id"]) if pd.notna(row["winner_account_id"]) else None
         l_id = int(row["loser_account_id"]) if pd.notna(row["loser_account_id"]) else None
 
         with st.container(border=True):
-            top = st.columns([1.0, 2.0, 2.0, 2.0])
+            top = st.columns([1.0, 2.0])
             top[0].markdown(f"**M#{mid}**")
-            top[1].write(f"**A:** {acc_short(a_id)}")
-            top[2].write(f"**B:** {acc_short(b_id)}")
-            top[3].write(f"**Resolved:** {row['resolved_at']}")
+            top[1].write(f"**Resolved:** {row['resolved_at']}")
 
             bot = st.columns([2.0, 2.0, 2.0, 2.0])
             bot[0].markdown(f"✅ **Winner:** {acc_short(w_id)}")
